@@ -30,6 +30,14 @@ def run_low_resource_experiments(
     amp: str = "auto",
     torch_compile: bool = False,
     tf32: bool = True,
+    model_type: str = "decoder",
+    diffusion_steps: int = 128,
+    diffusion_time_epsilon: float = 1e-3,
+    diffusion_scheduler: str = "linear",
+    diffusion_loss_weight: str = "scheduler",
+    diffusion_remasking: str = "low_confidence",
+    diffusion_stochastic_transfer: bool = False,
+    diffusion_block_size: int = 0,
 ) -> dict[str, Any]:
     split_dir = Path(split_dir)
     out = Path(output_dir)
@@ -57,6 +65,7 @@ def run_low_resource_experiments(
             ]
 
             cfg = LMConfig(
+                model_type=model_type,
                 epochs=epochs,
                 batch_size=batch_size,
                 max_seq_len=max_seq_len,
@@ -65,6 +74,13 @@ def run_low_resource_experiments(
                 amp=amp,
                 torch_compile=torch_compile,
                 tf32=tf32,
+                diffusion_steps=diffusion_steps,
+                diffusion_time_epsilon=diffusion_time_epsilon,
+                diffusion_scheduler=diffusion_scheduler,
+                diffusion_loss_weight=diffusion_loss_weight,
+                diffusion_remasking=diffusion_remasking,
+                diffusion_stochastic_transfer=diffusion_stochastic_transfer,
+                diffusion_block_size=diffusion_block_size,
             )
             model_dir = out / f"{rep_name}_train{size}"
             try:

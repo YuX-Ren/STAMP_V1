@@ -53,6 +53,12 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--model-type",
+        default="decoder",
+        choices=["decoder", "diffusion"],
+        help="Language model type used by train-lm. decoder=autoregressive, diffusion=MDLM-style masked diffusion.",
+    )
     p.add_argument("--num-data-workers", type=int, default=0, help="DataLoader worker processes.")
     p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when num-data-workers > 0.")
     p.add_argument(
@@ -64,6 +70,47 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--torch-compile", action="store_true", help="Enable torch.compile for model forward.")
     p.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmul/cudnn on CUDA.")
     p.add_argument(
+        "--diffusion-steps",
+        type=int,
+        default=128,
+        help="Diffusion denoising steps for training/sampling (diffusion mode).",
+    )
+    p.add_argument(
+        "--diffusion-time-epsilon",
+        type=float,
+        default=1e-3,
+        help="Lower bound of sampled timesteps t in diffusion training.",
+    )
+    p.add_argument(
+        "--diffusion-scheduler",
+        default="linear",
+        choices=["linear", "cosine"],
+        help="Alpha scheduler for diffusion masking.",
+    )
+    p.add_argument(
+        "--diffusion-loss-weight",
+        default="scheduler",
+        choices=["scheduler", "uniform"],
+        help="Per-token loss weighting in diffusion training.",
+    )
+    p.add_argument(
+        "--diffusion-remasking",
+        default="low_confidence",
+        choices=["low_confidence", "random"],
+        help="Remasking strategy during diffusion sampling.",
+    )
+    p.add_argument(
+        "--diffusion-stochastic-transfer",
+        action="store_true",
+        help="Use stochastic binomial token transfer counts in diffusion sampling.",
+    )
+    p.add_argument(
+        "--diffusion-block-size",
+        type=int,
+        default=0,
+        help="Block size for diffusion sampling. <=0 means full generation window.",
+    )
+    p.add_argument(
         "--device",
         default="cuda",
         help="Torch device, e.g. cuda / cuda:0 / cpu / auto. Default: cuda.",
@@ -72,6 +119,7 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
 
 def _cfg_from_args(args: argparse.Namespace) -> LMConfig:
     cfg = LMConfig(
+        model_type=args.model_type,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -88,6 +136,13 @@ def _cfg_from_args(args: argparse.Namespace) -> LMConfig:
         amp=args.amp,
         torch_compile=bool(args.torch_compile),
         tf32=not bool(args.no_tf32),
+        diffusion_steps=args.diffusion_steps,
+        diffusion_time_epsilon=args.diffusion_time_epsilon,
+        diffusion_scheduler=args.diffusion_scheduler,
+        diffusion_loss_weight=args.diffusion_loss_weight,
+        diffusion_remasking=args.diffusion_remasking,
+        diffusion_stochastic_transfer=bool(args.diffusion_stochastic_transfer),
+        diffusion_block_size=args.diffusion_block_size,
     )
     if getattr(args, "preset", "none") == "moses_gpt20m":
         cfg.d_model = 768
@@ -158,6 +213,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_denovo.add_argument("--max-new-tokens", type=int, default=256)
     p_denovo.add_argument("--temperature", type=float, default=1.0)
     p_denovo.add_argument("--top-k", type=int, default=50)
+    p_denovo.add_argument("--diffusion-steps", type=int, default=None, help="Optional override for diffusion sampling steps.")
+    p_denovo.add_argument(
+        "--diffusion-block-size",
+        type=int,
+        default=None,
+        help="Optional override for diffusion sampling block size.",
+    )
+    p_denovo.add_argument(
+        "--diffusion-remasking",
+        default=None,
+        choices=["low_confidence", "random"],
+        help="Optional override for diffusion remasking strategy.",
+    )
+    p_denovo.add_argument(
+        "--diffusion-stochastic-transfer",
+        action="store_true",
+        help="Enable stochastic token transfer counts in diffusion sampling.",
+    )
     p_denovo.add_argument("--decode-batch-size", type=int, default=256)
     p_denovo.add_argument(
         "--eval-workers",
@@ -288,6 +361,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_low.add_argument("--torch-compile", action="store_true", help="Enable torch.compile for model forward.")
     p_low.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmul/cudnn on CUDA.")
+    p_low.add_argument("--model-type", default="decoder", choices=["decoder", "diffusion"])
+    p_low.add_argument("--diffusion-steps", type=int, default=128)
+    p_low.add_argument("--diffusion-time-epsilon", type=float, default=1e-3)
+    p_low.add_argument("--diffusion-scheduler", default="linear", choices=["linear", "cosine"])
+    p_low.add_argument("--diffusion-loss-weight", default="scheduler", choices=["scheduler", "uniform"])
+    p_low.add_argument("--diffusion-remasking", default="low_confidence", choices=["low_confidence", "random"])
+    p_low.add_argument("--diffusion-stochastic-transfer", action="store_true")
+    p_low.add_argument("--diffusion-block-size", type=int, default=0)
     p_low.add_argument("--no-tqdm", action="store_true")
 
     p_table = sp.add_parser("make-tables", help="Generate markdown tables for paper/report.")
@@ -507,6 +588,10 @@ def main() -> int:
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            diffusion_steps=args.diffusion_steps,
+            diffusion_block_size=args.diffusion_block_size,
+            diffusion_remasking=args.diffusion_remasking,
+            diffusion_stochastic_transfer=(True if args.diffusion_stochastic_transfer else None),
             decode_batch_size=args.decode_batch_size,
             eval_workers=args.eval_workers,
             eval_chunksize=args.eval_chunksize,
@@ -639,6 +724,14 @@ def main() -> int:
             amp=args.amp,
             torch_compile=bool(args.torch_compile),
             tf32=not bool(args.no_tf32),
+            model_type=args.model_type,
+            diffusion_steps=args.diffusion_steps,
+            diffusion_time_epsilon=args.diffusion_time_epsilon,
+            diffusion_scheduler=args.diffusion_scheduler,
+            diffusion_loss_weight=args.diffusion_loss_weight,
+            diffusion_remasking=args.diffusion_remasking,
+            diffusion_stochastic_transfer=bool(args.diffusion_stochastic_transfer),
+            diffusion_block_size=args.diffusion_block_size,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0

@@ -38,6 +38,10 @@ def run_denovo_sampling_eval(
     max_new_tokens: int = 256,
     temperature: float = 1.0,
     top_k: int = 50,
+    diffusion_steps: int | None = None,
+    diffusion_block_size: int | None = None,
+    diffusion_remasking: str | None = None,
+    diffusion_stochastic_transfer: bool | None = None,
     decode_batch_size: int = 256,
     reference_max_samples: int | None = None,
     assume_train_canonical: bool | None = None,
@@ -72,6 +76,10 @@ def run_denovo_sampling_eval(
             top_k=top_k,
             prompt_tokens=None,
             device=dev,
+            diffusion_steps=diffusion_steps,
+            diffusion_block_size=diffusion_block_size,
+            diffusion_remasking=diffusion_remasking,
+            diffusion_stochastic_transfer=diffusion_stochastic_transfer,
         )
         batches.extend(toks_batch)
         n_done += k
@@ -111,6 +119,10 @@ def run_denovo_sampling_eval(
             "n_samples": n_samples,
             "temperature": temperature,
             "top_k": top_k,
+            "diffusion_steps": diffusion_steps,
+            "diffusion_block_size": diffusion_block_size,
+            "diffusion_remasking": diffusion_remasking,
+            "diffusion_stochastic_transfer": diffusion_stochastic_transfer,
             "decode_batch_size": batch_size,
             "device": str(dev),
             "assume_train_canonical": assume_train,

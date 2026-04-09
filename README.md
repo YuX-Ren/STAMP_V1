@@ -31,3 +31,5 @@
 - Run benchmark experiments from checklist (A-E):
   - `python scripts/experiments_cli.py --help`
   - detailed usage: `docs/experiments.md`
+  - diffusion LM (MDLM-style) training example:
+    - `python scripts/experiments_cli.py train-lm --train data/benchmark_splits/train.smiles --valid data/benchmark_splits/valid.smiles --representation smiles --output-dir results/benchmark/expB_smiles_diff --model-type diffusion --diffusion-steps 128 --diffusion-scheduler linear`
