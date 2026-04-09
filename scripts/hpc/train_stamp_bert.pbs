@@ -1,0 +1,10 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N flow_decoder
+#PBS -l walltime=144:00:00
+#PBS -l select=1:ngpus=1
+source /scratch/yuxuan.ren/miniconda3/bin/activate
+cd /home/svu/yuxuan.ren
+python scripts/experiments_cli.py pretrain-roberta --train data/moses/train.smiles --valid data/moses/valid.smiles --representation stamp --output-dir output/pretrain_stamp --batch-size 512 --lr 2e-4  --pretrain-epochs 20 --device cuda --encode-workers 32

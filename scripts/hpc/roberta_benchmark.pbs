@@ -1,0 +1,231 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_roberta
+#PBS -l walltime=72:00:00
+#PBS -l select=1:ngpus=1:ncpus=16
+
+set -euo pipefail
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate
+
+cd /home/svu/yuxuan.ren/STAMP
+
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+which python
+python --version
+nvidia-smi || true
+
+# ---- Thread control ----
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+
+# ---- Configurable via qsub -v ----
+: "${RUN_ROOT:=results/benchmark_20260403_193312}"
+: "${REPRS:=smiles stamp selfies safe group-selfies fragsmiles}"
+: "${TASKS:=bbbp,hiv,tox21}"
+: "${ENCODE_WORKERS:=16}"
+: "${ENCODE_CHUNKSIZE:=256}"
+: "${NUM_DATA_WORKERS:=4}"
+: "${STAGE:=all}"  # pretrain | finetune | all
+
+# ---- RoBERTa architecture (paper defaults) ----
+D_MODEL=768
+N_HEADS=12
+N_LAYERS=6
+D_FF=1536
+MAX_SEQ_LEN=512
+MASK_PROB=0.15
+
+# ---- Pre-training ----
+PT_BATCH_SIZE=512
+PT_LR=5e-4
+PT_EPOCHS=20
+
+# ---- Fine-tuning ----
+FT_BATCH_SIZE=32
+FT_LR=2e-5
+FT_EPOCHS=20
+FT_DROPOUT=0.1
+
+# ---- Paths (full MOSES dataset) ----
+TRAIN_SMILES="data/moses/train.smiles"
+VALID_SMILES="data/moses/valid.smiles"
+ROBERTA_ROOT="${RUN_ROOT}/expG_roberta"
+
+mkdir -p "${ROBERTA_ROOT}"
+
+echo "============================================"
+echo "[INFO] RUN_ROOT=${RUN_ROOT}"
+echo "[INFO] ROBERTA_ROOT=${ROBERTA_ROOT}"
+echo "[INFO] REPRS=${REPRS}"
+echo "[INFO] TASKS=${TASKS}"
+echo "[INFO] STAGE=${STAGE}"
+echo "============================================"
+
+# ========================================================================
+# Stage 1: Pre-train RoBERTa MLM for each representation
+# ========================================================================
+run_pretrain() {
+  for r in ${REPRS}; do
+    echo ""
+    echo "========== Pre-train RoBERTa: ${r} =========="
+    echo "Start: $(date)"
+
+    PT_DIR="${ROBERTA_ROOT}/pretrained/${r}"
+    if [ -f "${PT_DIR}/pretrained_roberta.pt" ]; then
+      echo "[SKIP] Already exists: ${PT_DIR}/pretrained_roberta.pt"
+      continue
+    fi
+
+    time python scripts/experiments_cli.py pretrain-roberta \
+      --train "${TRAIN_SMILES}" \
+      --valid "${VALID_SMILES}" \
+      --representation "${r}" \
+      --output-dir "${PT_DIR}" \
+      --d-model ${D_MODEL} \
+      --n-heads ${N_HEADS} \
+      --n-layers ${N_LAYERS} \
+      --d-ff ${D_FF} \
+      --max-seq-len ${MAX_SEQ_LEN} \
+      --mask-prob ${MASK_PROB} \
+      --batch-size ${PT_BATCH_SIZE} \
+      --lr ${PT_LR} \
+      --pretrain-epochs ${PT_EPOCHS} \
+      --encode-workers "${ENCODE_WORKERS}" \
+      --encode-chunksize "${ENCODE_CHUNKSIZE}" \
+      --num-data-workers "${NUM_DATA_WORKERS}" \
+      --prefetch-factor 4 \
+      --amp auto \
+      --device cuda
+
+    echo "[DONE] Pre-train ${r}: $(date)"
+  done
+}
+
+# ========================================================================
+# Stage 2: Fine-tune on MoleculeNet tasks (BBBP, HIV, Tox21)
+# ========================================================================
+run_finetune() {
+  IFS=',' read -ra TASK_LIST <<< "${TASKS}"
+
+  for r in ${REPRS}; do
+    PT_DIR="${ROBERTA_ROOT}/pretrained/${r}"
+    if [ ! -f "${PT_DIR}/pretrained_roberta.pt" ]; then
+      echo "[SKIP] No pretrained model for ${r}, skipping fine-tune."
+      continue
+    fi
+
+    for task in "${TASK_LIST[@]}"; do
+      echo ""
+      echo "========== Fine-tune: ${r} / ${task} =========="
+      echo "Start: $(date)"
+
+      FT_DIR="${ROBERTA_ROOT}/finetune/${r}/${task}"
+      if [ -f "${FT_DIR}/finetune_results.json" ]; then
+        echo "[SKIP] Already exists: ${FT_DIR}/finetune_results.json"
+        continue
+      fi
+
+      time python scripts/experiments_cli.py finetune-roberta \
+        --pretrained-dir "${PT_DIR}" \
+        --task "${task}" \
+        --output-dir "${FT_DIR}" \
+        --finetune-epochs ${FT_EPOCHS} \
+        --finetune-lr ${FT_LR} \
+        --finetune-batch-size ${FT_BATCH_SIZE} \
+        --dropout ${FT_DROPOUT} \
+        --encode-workers "${ENCODE_WORKERS}" \
+        --encode-chunksize "${ENCODE_CHUNKSIZE}" \
+        --num-data-workers "${NUM_DATA_WORKERS}" \
+        --prefetch-factor 4 \
+        --amp auto \
+        --device cuda
+
+      echo "[DONE] Fine-tune ${r}/${task}: $(date)"
+    done
+  done
+}
+
+# ========================================================================
+# Stage 3: Collect summary
+# ========================================================================
+run_summary() {
+  echo ""
+  echo "========== Collecting summary =========="
+
+  python -c "
+import json, csv, sys
+from pathlib import Path
+
+root = Path('${ROBERTA_ROOT}')
+reprs = '${REPRS}'.split()
+tasks = '${TASKS}'.split(',')
+
+rows = []
+for r in reprs:
+    row = {'representation': r}
+    for t in tasks:
+        p = root / 'finetune' / r / t / 'finetune_results.json'
+        if p.exists():
+            d = json.loads(p.read_text())
+            row[f'{t}_roc_auc'] = d.get('test_roc_auc', 'N/A')
+            row[f'{t}_accuracy'] = d.get('test_accuracy', 'N/A')
+        else:
+            row[f'{t}_roc_auc'] = 'N/A'
+            row[f'{t}_accuracy'] = 'N/A'
+    rows.append(row)
+
+# Print table
+header = ['representation'] + [f'{t}_roc_auc' for t in tasks] + [f'{t}_accuracy' for t in tasks]
+print('\t'.join(header))
+for row in rows:
+    print('\t'.join(str(row.get(h, '')) for h in header))
+
+# Save CSV
+out = root / 'roberta_summary.csv'
+with out.open('w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=header)
+    w.writeheader()
+    w.writerows(rows)
+print(f'\nSaved: {out}')
+
+# Save JSON
+(root / 'roberta_summary.json').write_text(json.dumps(rows, indent=2))
+"
+
+  echo "[DONE] Summary saved to ${ROBERTA_ROOT}/roberta_summary.csv"
+}
+
+# ========================================================================
+# Dispatch
+# ========================================================================
+case "${STAGE}" in
+  pretrain)
+    run_pretrain
+    ;;
+  finetune)
+    run_finetune
+    run_summary
+    ;;
+  all)
+    run_pretrain
+    run_finetune
+    run_summary
+    ;;
+  *)
+    echo "[ERROR] Unknown STAGE=${STAGE}. Valid: pretrain | finetune | all"
+    exit 1
+    ;;
+esac
+
+echo ""
+echo "============================================"
+echo "[DONE] STAGE=${STAGE} at $(date)"
+echo "[DONE] Results: ${ROBERTA_ROOT}"
+echo "============================================"

@@ -1,0 +1,123 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_runbook
+#PBS -l walltime=144:00:00
+#PBS -l select=1:ngpus=1
+
+set -euo pipefail
+
+# ---------- User-configurable (can be overridden by qsub -v) ----------
+: "${REPO_ROOT:=/home/svu/yuxuan.ren/STAMP}"
+: "${DATA_CSV:=data/zinc250k.csv}"
+: "${SMILES_COL:=smiles}"
+: "${REPRS:=smiles stamp selfies group-selfies fragsmiles safe}"
+: "${ENCODE_WORKERS:=32}"
+: "${ENCODE_CHUNKSIZE:=256}"
+: "${NUM_DATA_WORKERS:=8}"
+: "${STAGE:=all_moses}"   # prepare | repr | denovo_moses | all_moses | plots
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate
+conda activate "${ENV_NAME}"
+
+cd "${REPO_ROOT}"
+
+if [[ -n "${RUN_ROOT:-}" ]]; then
+  export RUN_ROOT
+else
+  export RUN_ROOT="results/benchmark_20260403_180057"
+fi
+mkdir -p "${RUN_ROOT}"
+
+echo "[INFO] ENV_NAME=${ENV_NAME}"
+echo "[INFO] RUN_ROOT=${RUN_ROOT}"
+echo "[INFO] STAGE=${STAGE}"
+echo "[INFO] REPRS=${REPRS}"
+echo "${RUN_ROOT}" > "${RUN_ROOT}/RUN_ROOT.txt"
+
+run_prepare() {
+  python scripts/experiments_cli.py prepare-data \
+    --input "${DATA_CSV}" \
+    --smiles-column "${SMILES_COL}" \
+    --output-dir "${RUN_ROOT}" \
+    --train-size 100000 \
+    --valid-size 10000 \
+    --test-size 10000 \
+    --low-resource-sizes 10000,50000,100000
+}
+
+run_repr() {
+  python scripts/experiments_cli.py repr-stats \
+    --input "${RUN_ROOT}/splits/train.smiles" \
+    --output-dir "${RUN_ROOT}/expA_repr_stats" \
+    --representations "$(echo "${REPRS}" | tr ' ' ',')" \
+    --max-mols 20000
+}
+
+run_denovo_moses() {
+  for r in ${REPRS}; do
+    echo "=== train+sample moses_gpt20m: ${r} ==="
+    python scripts/experiments_cli.py train-lm \
+      --train "${RUN_ROOT}/splits/train.smiles" \
+      --valid "${RUN_ROOT}/splits/valid.smiles" \
+      --representation "${r}" \
+      --output-dir "${RUN_ROOT}/expB_${r}_lm_moses20m" \
+      --encode-workers "${ENCODE_WORKERS}" \
+      --encode-chunksize "${ENCODE_CHUNKSIZE}" \
+      --num-data-workers "${NUM_DATA_WORKERS}" \
+      --prefetch-factor 4 \
+      --amp auto \
+      --torch-compile \
+      --preset moses_gpt20m \
+      --batch-size 256 \
+      --max-seq-len 256 \
+      --device cuda
+
+    python scripts/experiments_cli.py sample-eval \
+      --model-dir "${RUN_ROOT}/expB_${r}_lm_moses20m" \
+      --train "${RUN_ROOT}/splits/train.smiles" \
+      --reference "${RUN_ROOT}/splits/test.smiles" \
+      --output-dir "${RUN_ROOT}/expB_${r}_denovo_moses20m" \
+      --n-samples 10000 \
+      --decode-batch-size 1024 \
+      --eval-workers 16 \
+      --eval-chunksize 512 \
+      --reference-max-samples 50000 \
+      --assume-train-canonical \
+      --device cuda
+  done
+}
+
+run_plots() {
+  python scripts/experiments_cli.py make-plots \
+    --run-root "${RUN_ROOT}"
+}
+
+case "${STAGE}" in
+  prepare)
+    run_prepare
+    ;;
+  repr)
+    run_repr
+    ;;
+  denovo_moses)
+    run_denovo_moses
+    ;;
+  all_moses)
+    run_prepare
+    run_repr
+    run_denovo_moses
+    run_plots
+    ;;
+  plots)
+    run_plots
+    ;;
+  *)
+    echo "[ERROR] Unknown STAGE=${STAGE}"
+    echo "Valid: prepare | repr | denovo_moses | all_moses | plots"
+    exit 1
+    ;;
+esac
+
+echo "[DONE] STAGE=${STAGE} RUN_ROOT=${RUN_ROOT}"

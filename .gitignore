@@ -1,0 +1,7 @@
+results/
+test/
+*.csv
+*.smiles
+output/
+.codex
+*.pyc
