@@ -1,0 +1,18 @@
+name: stamp-train-rdkit-2025_09_4
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rdkit=2025.09.4
+  - pytorch=2.6.0
+  - pytorch-cuda=12.4
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - tqdm
+  - requests
+  - pyyaml
+  - pip

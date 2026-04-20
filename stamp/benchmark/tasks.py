@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import random
 from contextlib import nullcontext
 from concurrent.futures import ProcessPoolExecutor
 from itertools import combinations
@@ -17,16 +18,53 @@ from rdkit.Chem import BRICS
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem.rdchem import BondType
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from .common import canonicalize_smiles, iterable_with_progress
-from .lm import LMConfig, NextTokenDataset, TinyDecoderLM, TokenVocab, _ids_with_special_tokens, _resolve_amp_mode, _resolve_torch_device, _set_seed, build_dynamic_lm_collate_fn, load_trained_model, sample_model_sequences
+from .lm import (
+    LMConfig,
+    NextTokenDataset,
+    TinyDecoderLM,
+    TokenVocab,
+    _add_gumbel_noise,
+    _apply_top_k_logits,
+    _compute_ao_gpt_loss,
+    _ids_with_special_tokens,
+    _normalize_model_type,
+    _resolve_amp_mode,
+    _resolve_torch_device,
+    _set_seed,
+    build_dynamic_lm_collate_fn,
+    load_trained_model,
+    sample_model_sequences,
+)
+from .metrics import evaluate_generated_smiles
 from .representations import RepresentationError, UnsupportedRepresentation, build_representation
 
 _COMP_WORKER_REP = None
-_COMP_WORKER_CFG: tuple[str, str, Optional[str], Optional[str]] | None = None
+_COMP_WORKER_CFG: tuple[str, str, Optional[str], Optional[str], bool, bool] | None = None
 _EVAL_WORKER_REP = None
 _MULTI_COMPONENT_PROMPT_SEP = "<DOT>"
+
+
+class MaskedSpanInfillDataset(Dataset):
+    def __init__(self, masked_ids: Sequence[list[int]], label_ids: Sequence[list[int]], max_seq_len: int, pad_id: int) -> None:
+        self.samples: list[tuple[list[int], list[int]]] = []
+        self.pad_id = pad_id
+        for x_ids, y_ids in zip(masked_ids, label_ids):
+            if len(x_ids) != len(y_ids):
+                continue
+            ids_x = x_ids[:max_seq_len]
+            ids_y = y_ids[:max_seq_len]
+            if not ids_x:
+                continue
+            self.samples.append((ids_x, ids_y))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[list[int], list[int]]:
+        return self.samples[idx]
 
 
 def _scaffold_row_from_smiles(smiles: str, min_scaffold_heavy_atoms: int) -> Optional[tuple[str, str, str]]:
@@ -259,13 +297,14 @@ def _tokenize_completion_row_local(
     target_key: str,
     prompt_template: Optional[str],
     target_template: Optional[str],
+    prompt_is_repr: bool = False,
+    target_is_repr: bool = False,
 ) -> Optional[list[str]]:
     try:
         prompt_raw = prompt_template.format(**row) if prompt_template is not None else row[prompt_key]
         target_raw = target_template.format(**row) if target_template is not None else row[target_key]
-        prompt_tokens = _encode_completion_prompt_tokens(rep, prompt_raw)
-        target_text = rep.encode(target_raw)
-        target_tokens = rep.tokenize(target_text)
+        prompt_tokens = _encode_completion_prompt_tokens(rep, prompt_raw, is_repr=prompt_is_repr)
+        target_tokens = _encode_completion_target_tokens(rep, target_raw, is_repr=target_is_repr)
     except Exception:
         return None
     if not prompt_tokens or not target_tokens:
@@ -273,7 +312,16 @@ def _tokenize_completion_row_local(
     return prompt_tokens + ["<SEP>"] + target_tokens
 
 
-def _encode_completion_prompt_tokens(rep, prompt_raw: str) -> list[str]:
+def _encode_completion_target_tokens(rep, target_raw: str, is_repr: bool = False) -> list[str]:
+    if is_repr:
+        return [tok for tok in str(target_raw).split() if tok]
+    target_text = rep.encode(target_raw)
+    return rep.tokenize(target_text)
+
+
+def _encode_completion_prompt_tokens(rep, prompt_raw: str, is_repr: bool = False) -> list[str]:
+    if is_repr:
+        return [tok for tok in str(prompt_raw).split() if tok]
     # STAMP cannot encode disconnected molecules (e.g. "frag_a.frag_b") in one pass.
     # For linker prompts, encode each component separately and stitch token streams.
     if getattr(rep, "name", "") == "stamp" and "." in prompt_raw:
@@ -294,14 +342,17 @@ def _encode_completion_prompt_tokens(rep, prompt_raw: str) -> list[str]:
 
 def _init_completion_worker(
     representation: str,
+    stamp_vocab: Optional[str],
     prompt_key: str,
     target_key: str,
     prompt_template: Optional[str],
     target_template: Optional[str],
+    prompt_is_repr: bool,
+    target_is_repr: bool,
 ) -> None:
     global _COMP_WORKER_REP, _COMP_WORKER_CFG
-    _COMP_WORKER_REP = build_representation(representation)
-    _COMP_WORKER_CFG = (prompt_key, target_key, prompt_template, target_template)
+    _COMP_WORKER_REP = build_representation(representation, stamp_vocab=stamp_vocab)
+    _COMP_WORKER_CFG = (prompt_key, target_key, prompt_template, target_template, prompt_is_repr, target_is_repr)
 
 
 def _tokenize_completion_row_worker(row: dict[str, str]) -> Optional[list[str]]:
@@ -309,7 +360,7 @@ def _tokenize_completion_row_worker(row: dict[str, str]) -> Optional[list[str]]:
     cfg = _COMP_WORKER_CFG
     if rep is None or cfg is None:
         raise RuntimeError("Completion tokenize worker is not initialized.")
-    prompt_key, target_key, prompt_template, target_template = cfg
+    prompt_key, target_key, prompt_template, target_template, prompt_is_repr, target_is_repr = cfg
     return _tokenize_completion_row_local(
         rep,
         row,
@@ -317,22 +368,27 @@ def _tokenize_completion_row_worker(row: dict[str, str]) -> Optional[list[str]]:
         target_key=target_key,
         prompt_template=prompt_template,
         target_template=target_template,
+        prompt_is_repr=prompt_is_repr,
+        target_is_repr=target_is_repr,
     )
 
 
 def _tokenize_completion_records(
     records: Sequence[dict[str, str]],
     representation: str,
+    stamp_vocab: Optional[str],
     prompt_key: str,
     target_key: str,
     prompt_template: Optional[str],
     target_template: Optional[str],
+    prompt_is_repr: bool,
+    target_is_repr: bool,
     show_progress: bool,
     desc: str,
     num_workers: int,
     chunksize: int,
 ) -> list[list[str]]:
-    rep = build_representation(representation)
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
     if num_workers <= 0:
         num_workers = max(1, os.cpu_count() or 1)
 
@@ -352,6 +408,8 @@ def _tokenize_completion_records(
                 target_key=target_key,
                 prompt_template=prompt_template,
                 target_template=target_template,
+                prompt_is_repr=prompt_is_repr,
+                target_is_repr=target_is_repr,
             )
             if toks:
                 seqs.append(toks)
@@ -360,7 +418,16 @@ def _tokenize_completion_records(
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_completion_worker,
-        initargs=(representation, prompt_key, target_key, prompt_template, target_template),
+        initargs=(
+            representation,
+            stamp_vocab,
+            prompt_key,
+            target_key,
+            prompt_template,
+            target_template,
+            prompt_is_repr,
+            target_is_repr,
+        ),
     ) as pool:
         mapped = pool.map(
             _tokenize_completion_row_worker,
@@ -377,6 +444,656 @@ def _tokenize_completion_records(
             if toks:
                 seqs.append(toks)
     return seqs
+
+
+def train_ao_fragment_infill(
+    records: Sequence[dict[str, str]],
+    representation: str,
+    output_dir: str | Path,
+    cfg: Optional[LMConfig] = None,
+    show_progress: bool = True,
+    device: Optional[str] = None,
+    stamp_vocab: Optional[str] = None,
+) -> dict[str, Any]:
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
+    if isinstance(rep, UnsupportedRepresentation):
+        raise RepresentationError(
+            f"Cannot train AO fragment infill for unsupported placeholder: {representation}"
+        )
+    cfg = cfg or LMConfig(model_type="ao_gpt")
+    cfg.model_type = "ao_gpt"
+    _set_seed(cfg.seed)
+    dev = _resolve_torch_device(device)
+
+    masked_ids, label_ids, vocab = _encode_infill_records(records, rep, cfg.max_seq_len)
+    if not masked_ids:
+        raise ValueError("No valid infill records after encoding.")
+    n_valid = max(1, int(0.1 * len(masked_ids)))
+    if len(masked_ids) <= n_valid:
+        n_valid = max(1, len(masked_ids) // 2)
+    ds_train = MaskedSpanInfillDataset(masked_ids[:-n_valid], label_ids[:-n_valid], cfg.max_seq_len, vocab.pad_id)
+    ds_valid = MaskedSpanInfillDataset(masked_ids[-n_valid:], label_ids[-n_valid:], cfg.max_seq_len, vocab.pad_id)
+
+    collate_fn = build_dynamic_lm_collate_fn(vocab.pad_id, pad_to_multiple_of=(8 if dev.type == "cuda" else None))
+    loader_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, drop_last=False, collate_fn=collate_fn, pin_memory=(dev.type == "cuda"), num_workers=max(0, int(cfg.num_data_workers)))
+    loader_valid = DataLoader(ds_valid, batch_size=cfg.batch_size, shuffle=False, drop_last=False, collate_fn=collate_fn, pin_memory=(dev.type == "cuda"), num_workers=max(0, int(cfg.num_data_workers)))
+
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(cfg.tf32)
+        torch.backends.cudnn.allow_tf32 = bool(cfg.tf32)
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    use_amp, amp_dtype, use_scaler, amp_label = _resolve_amp_mode(cfg.amp, dev)
+
+    model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
+    if cfg.torch_compile and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)  # type: ignore[misc]
+        except Exception:
+            pass
+    model.to(dev)
+    adamw_kwargs: Dict[str, Any] = {"lr": cfg.lr, "weight_decay": cfg.weight_decay}
+    if dev.type == "cuda":
+        try:
+            adamw_kwargs["fused"] = True
+        except Exception:
+            pass
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+    except TypeError:
+        adamw_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)  # pragma: no cover
+
+    history: list[dict[str, float]] = []
+    non_blocking = dev.type == "cuda"
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        train_losses: list[float] = []
+        iterator = iterable_with_progress(loader_train, show_progress=show_progress, total=len(loader_train), desc=f"Train ao-infill[{representation}] ep{epoch}")
+        for x, y in iterator:
+            x = x.to(dev, non_blocking=non_blocking)
+            y = y.to(dev, non_blocking=non_blocking)
+            optimizer.zero_grad(set_to_none=True)
+            amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True) if use_amp else nullcontext()
+            with amp_ctx:
+                loss = _compute_ao_infill_loss(model, x, y, random_ratio=1.0)
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            train_losses.append(float(loss.item()))
+
+        model.eval()
+        valid_losses: list[float] = []
+        with torch.no_grad():
+            for x, y in loader_valid:
+                x = x.to(dev, non_blocking=non_blocking)
+                y = y.to(dev, non_blocking=non_blocking)
+                amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True) if use_amp else nullcontext()
+                with amp_ctx:
+                    loss = _compute_ao_infill_loss(model, x, y, random_ratio=1.0)
+                valid_losses.append(float(loss.item()))
+        tr = float(np.mean(train_losses)) if train_losses else float("nan")
+        va = float(np.mean(valid_losses)) if valid_losses else float("nan")
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": tr,
+                "valid_loss": va,
+                "train_ppl": float(math.exp(tr)) if not math.isnan(tr) else float("nan"),
+                "valid_ppl": float(math.exp(va)) if not math.isnan(va) else float("nan"),
+            }
+        )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp_vocab_rel = None
+    if stamp_vocab is not None:
+        import shutil
+        dest = out_dir / "stamp_vocab.txt"
+        shutil.copy2(stamp_vocab, dest)
+        stamp_vocab_rel = "stamp_vocab.txt"
+    torch.save(
+        {
+            "model_state": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
+            "cfg": vars(cfg),
+            "representation": representation,
+            "model_type": "ao_gpt",
+            "stamp_vocab": stamp_vocab_rel,
+            "task": "ao_fragment_infill",
+        },
+        out_dir / "model.pt",
+    )
+    (out_dir / "vocab.json").write_text(json.dumps(vocab.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "representation": representation,
+                "task": "ao_fragment_infill",
+                "n_records": len(records),
+                "n_train_samples": len(ds_train),
+                "n_valid_samples": len(ds_valid),
+                "cfg": vars(cfg),
+                "device": str(dev),
+                "stamp_vocab": stamp_vocab_rel,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {"output_dir": str(out_dir), "history": history, "device": str(dev)}
+
+
+def _stamp_fragment_groups(tokens: Sequence[str]) -> list[list[str]]:
+    groups: list[list[str]] = []
+    pending_prefix: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == "[END]":
+            break
+        if tok.startswith("[B_"):
+            pending_prefix.append(tok)
+            i += 1
+            continue
+        if tok.startswith("[J_") or tok.startswith("[S_") or tok in {"[BACK]", "[Ring]"}:
+            if groups:
+                groups[-1].append(tok)
+            else:
+                pending_prefix.append(tok)
+            i += 1
+            continue
+        group = list(pending_prefix)
+        pending_prefix.clear()
+        group.append(tok)
+        i += 1
+        while i < n and (tokens[i].startswith("[J_") or tokens[i].startswith("[S_") or tokens[i] == "[Ring]"):
+            group.append(tokens[i])
+            i += 1
+        groups.append(group)
+    if pending_prefix and groups:
+        groups[-1].extend(pending_prefix)
+    return groups
+
+
+def _mask_fragment_groups(
+    groups: Sequence[Sequence[str]],
+    rng,
+    min_mask_groups: int,
+    max_mask_groups: int,
+) -> Optional[tuple[list[str], list[str], list[str], int, int]]:
+    if not groups:
+        return None
+    n_groups = len(groups)
+    k_max = min(max(1, int(max_mask_groups)), n_groups)
+    k_min = min(max(1, int(min_mask_groups)), k_max)
+    k = int(rng.randint(k_min, k_max))
+    start = int(rng.randrange(0, n_groups - k + 1))
+    end = start + k
+    prompt_tokens: list[str] = []
+    masked_tokens: list[str] = []
+    target_tokens: list[str] = []
+    for idx, group in enumerate(groups):
+        if start <= idx < end:
+            target_tokens.extend(group)
+            masked_tokens.extend([TokenVocab.MASK] * len(group))
+        else:
+            prompt_tokens.extend(group)
+            masked_tokens.extend(group)
+            if idx + 1 == start:
+                prompt_tokens.append(TokenVocab.MASK)
+    if start == 0:
+        prompt_tokens = [TokenVocab.MASK] + prompt_tokens
+    return prompt_tokens, masked_tokens, target_tokens, start, k
+
+
+def _collapse_mask_runs(tokens: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    prev_mask = False
+    for tok in tokens:
+        is_mask = (tok == TokenVocab.MASK)
+        if is_mask and prev_mask:
+            continue
+        out.append(tok)
+        prev_mask = is_mask
+    return out
+
+
+def _build_group_keep_row(
+    rep,
+    source_smiles: str,
+    source_tokens: Sequence[str],
+    groups,
+    keep_group_indices: Sequence[int],
+) -> Optional[dict[str, Any]]:
+    keep_set = set(int(i) for i in keep_group_indices)
+    if not keep_set:
+        return None
+    masked_tokens: list[str] = []
+    target_tokens: list[str] = []
+    kept_any = False
+    masked_any = False
+    for idx, group in enumerate(groups):
+        group_toks = list(group.tokens)
+        if idx in keep_set:
+            masked_tokens.extend(group_toks)
+            kept_any = True
+        else:
+            masked_tokens.extend([TokenVocab.MASK] * len(group_toks))
+            target_tokens.extend(group_toks)
+            masked_any = True
+    if not kept_any or not masked_any:
+        return None
+    return {
+        "source_smiles": source_smiles,
+        "source_repr": rep.detokenize(source_tokens),
+        "prompt_repr": rep.detokenize(_collapse_mask_runs(masked_tokens)),
+        "masked_repr": rep.detokenize(masked_tokens),
+        "target_repr": rep.detokenize(target_tokens),
+    }
+
+
+def _encode_stamp_groups_from_smiles(rep, smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    groups = rep.codec.encode_mol_to_groups(mol)
+    source_repr = rep.encode(smiles)
+    source_tokens = rep.tokenize(source_repr)
+    if len(groups) == 0:
+        return None
+    return mol, source_tokens, groups
+
+
+def _build_linker_like_infill_row(
+    rep,
+    *,
+    source_smiles: str,
+    fragment_a_ap: str,
+    fragment_b_ap: str,
+    linker_ap: str,
+    task: str,
+) -> Optional[dict[str, Any]]:
+    try:
+        left_tokens = _encode_completion_prompt_tokens(rep, fragment_a_ap)
+        right_tokens = _encode_completion_prompt_tokens(rep, fragment_b_ap)
+        target_tokens = _encode_completion_target_tokens(rep, linker_ap)
+    except Exception:
+        return None
+    if not left_tokens or not right_tokens or not target_tokens:
+        return None
+    masked_tokens = list(left_tokens) + [TokenVocab.MASK] * len(target_tokens) + list(right_tokens)
+    prompt_tokens = list(left_tokens) + [TokenVocab.MASK] + list(right_tokens)
+    return {
+        "source_smiles": source_smiles,
+        "source_repr": "",
+        "prompt_repr": rep.detokenize(prompt_tokens),
+        "masked_repr": rep.detokenize(masked_tokens),
+        "target_repr": rep.detokenize(target_tokens),
+        "task": task,
+        "fragment_a_ap": fragment_a_ap,
+        "fragment_b_ap": fragment_b_ap,
+        "linker_ap": linker_ap,
+    }
+
+
+def _build_full_sequence_mask_row(
+    rep,
+    *,
+    source_smiles: str,
+    source_tokens: Sequence[str],
+    groups,
+    mask_group_indices: Sequence[int],
+    task: str,
+) -> Optional[dict[str, Any]]:
+    mask_set = set(int(i) for i in mask_group_indices)
+    if not mask_set:
+        return None
+    masked_tokens: list[str] = []
+    target_tokens: list[str] = []
+    any_masked = False
+    for idx, group in enumerate(groups):
+        group_toks = list(group.tokens)
+        if idx in mask_set:
+            masked_tokens.extend([TokenVocab.MASK] * len(group_toks))
+            target_tokens.extend(group_toks)
+            any_masked = True
+        else:
+            masked_tokens.extend(group_toks)
+    if not any_masked:
+        return None
+    return {
+        "source_smiles": source_smiles,
+        "source_repr": rep.detokenize(source_tokens),
+        "prompt_repr": rep.detokenize(_collapse_mask_runs(masked_tokens)),
+        "masked_repr": rep.detokenize(masked_tokens),
+        "target_repr": rep.detokenize(target_tokens),
+        "task": task,
+    }
+
+
+def _build_linker_group_mask_row(
+    rep,
+    *,
+    source_smiles: str,
+    ring_only: bool = False,
+    task_name: str = "linker_design",
+) -> Optional[dict[str, Any]]:
+    encoded = _encode_stamp_groups_from_smiles(rep, source_smiles)
+    if encoded is None:
+        return None
+    mol, source_tokens, groups = encoded
+    brics_bonds = []
+    for (a, b), _ in BRICS.FindBRICSBonds(mol):
+        bond = mol.GetBondBetweenAtoms(a, b)
+        if bond is not None:
+            brics_bonds.append(bond.GetIdx())
+    if len(brics_bonds) < 2:
+        return None
+    n_atoms = mol.GetNumAtoms()
+    for b1, b2 in combinations(brics_bonds[:8], 2):
+        frag_mol = Chem.FragmentOnBonds(mol, [b1, b2], addDummies=True)
+        frag_sets = Chem.GetMolFrags(frag_mol, asMols=False, sanitizeFrags=False)
+        linker_atoms: Optional[set[int]] = None
+        for atom_ids in frag_sets:
+            dummy_count = 0
+            orig_atoms: set[int] = set()
+            for aid in atom_ids:
+                atom = frag_mol.GetAtomWithIdx(int(aid))
+                if atom.GetAtomicNum() == 0:
+                    dummy_count += 1
+                elif int(aid) < n_atoms:
+                    orig_atoms.add(int(aid))
+            if dummy_count == 2 and orig_atoms:
+                linker_atoms = orig_atoms
+                break
+        if not linker_atoms:
+            continue
+        if ring_only:
+            ring_present = False
+            for atom_idx in linker_atoms:
+                if mol.GetAtomWithIdx(atom_idx).IsInRing():
+                    ring_present = True
+                    break
+            if not ring_present:
+                continue
+        mask_group_indices: list[int] = []
+        for idx, group in enumerate(groups):
+            atom_set = set(int(x) for x in group.atom_indices)
+            if atom_set and atom_set.issubset(linker_atoms):
+                mask_group_indices.append(idx)
+        if not mask_group_indices:
+            for idx, group in enumerate(groups):
+                atom_set = set(int(x) for x in group.atom_indices)
+                if atom_set and (len(atom_set & linker_atoms) / max(1, len(atom_set))) >= 0.5:
+                    mask_group_indices.append(idx)
+        row = _build_full_sequence_mask_row(
+            rep,
+            source_smiles=source_smiles,
+            source_tokens=source_tokens,
+            groups=groups,
+            mask_group_indices=mask_group_indices,
+            task=task_name,
+        )
+        if row is not None:
+            row["n_mask_groups"] = int(len(mask_group_indices))
+            return row
+    return None
+
+
+def build_fragment_infill_dataset(
+    smiles_list: Sequence[str],
+    output_path: str | Path,
+    representation: str = "stamp",
+    stamp_vocab: Optional[str] = None,
+    min_mask_groups: int = 1,
+    max_mask_groups: int = 3,
+    max_items: Optional[int] = None,
+    seed: int = 42,
+    show_progress: bool = True,
+) -> dict[str, Any]:
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
+    if isinstance(rep, UnsupportedRepresentation):
+        raise RepresentationError(
+            f"Cannot build fragment infill dataset for unsupported placeholder: {representation}"
+        )
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+
+    written = 0
+    iterator = smiles_list[: max_items if max_items is not None else None]
+    iterator = iterable_with_progress(
+        iterator,
+        show_progress=show_progress,
+        total=(min(len(smiles_list), int(max_items)) if max_items is not None else len(smiles_list)),
+        desc=f"Build infill[{representation}]",
+    )
+    with out.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "source_smiles",
+                "source_repr",
+                "prompt_repr",
+                "masked_repr",
+                "target_repr",
+                "mask_start_group",
+                "mask_group_count",
+            ],
+        )
+        writer.writeheader()
+        for smiles in iterator:
+            try:
+                source_repr = rep.encode(smiles)
+                tokens = rep.tokenize(source_repr)
+            except Exception:
+                continue
+            if not tokens:
+                continue
+            if getattr(rep, "name", "") == "stamp":
+                groups = _stamp_fragment_groups(tokens)
+            else:
+                groups = [[tok] for tok in tokens]
+            masked = _mask_fragment_groups(groups, rng, min_mask_groups=min_mask_groups, max_mask_groups=max_mask_groups)
+            if masked is None:
+                continue
+            prompt_tokens, masked_tokens, target_tokens, start, k = masked
+            if not prompt_tokens or not target_tokens:
+                continue
+            writer.writerow(
+                {
+                    "source_smiles": smiles,
+                    "source_repr": rep.detokenize(tokens),
+                    "prompt_repr": rep.detokenize(prompt_tokens),
+                    "masked_repr": rep.detokenize(masked_tokens),
+                    "target_repr": rep.detokenize(target_tokens),
+                    "mask_start_group": int(start),
+                    "mask_group_count": int(k),
+                }
+            )
+            written += 1
+    return {
+        "output_path": str(out),
+        "representation": representation,
+        "n_rows": written,
+        "min_mask_groups": int(min_mask_groups),
+        "max_mask_groups": int(max_mask_groups),
+        "seed": int(seed),
+    }
+
+
+def build_motif_extension_dataset(
+    smiles_list: Sequence[str],
+    output_path: str | Path,
+    representation: str = "stamp",
+    stamp_vocab: Optional[str] = None,
+    max_items: Optional[int] = None,
+    seed: int = 42,
+    show_progress: bool = True,
+) -> dict[str, Any]:
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
+    if getattr(rep, "name", "") != "stamp":
+        raise RepresentationError("Motif extension dataset currently requires STAMP representation.")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    written = 0
+    rows = smiles_list[: max_items if max_items is not None else None]
+    iterator = iterable_with_progress(rows, show_progress=show_progress, total=(min(len(smiles_list), int(max_items)) if max_items is not None else len(smiles_list)), desc="Build motif extension")
+    with out.open("w", encoding="utf-8", newline="") as f:
+        fieldnames = ["source_smiles", "source_repr", "prompt_repr", "masked_repr", "target_repr", "task", "kept_group_index", "kept_motif"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for smiles in iterator:
+            encoded = _encode_stamp_groups_from_smiles(rep, smiles)
+            if encoded is None:
+                continue
+            _, source_tokens, groups = encoded
+            keep_idx = rng.randrange(len(groups))
+            row = _build_group_keep_row(rep, smiles, source_tokens, groups, [keep_idx])
+            if row is None:
+                continue
+            row.update({"task": "motif_extension", "kept_group_index": int(keep_idx), "kept_motif": groups[keep_idx].motif})
+            writer.writerow(row)
+            written += 1
+    return {"output_path": str(out), "representation": representation, "task": "motif_extension", "n_rows": written, "seed": int(seed)}
+
+
+def build_superstructure_generation_dataset(
+    smiles_list: Sequence[str],
+    output_path: str | Path,
+    representation: str = "stamp",
+    stamp_vocab: Optional[str] = None,
+    max_items: Optional[int] = None,
+    min_keep_groups: int = 1,
+    max_keep_groups: int = 3,
+    seed: int = 42,
+    show_progress: bool = True,
+) -> dict[str, Any]:
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
+    if getattr(rep, "name", "") != "stamp":
+        raise RepresentationError("Superstructure generation dataset currently requires STAMP representation.")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    written = 0
+    rows = smiles_list[: max_items if max_items is not None else None]
+    iterator = iterable_with_progress(rows, show_progress=show_progress, total=(min(len(smiles_list), int(max_items)) if max_items is not None else len(smiles_list)), desc="Build superstructure")
+    with out.open("w", encoding="utf-8", newline="") as f:
+        fieldnames = ["source_smiles", "source_repr", "prompt_repr", "masked_repr", "target_repr", "task", "subtree_root_group", "kept_group_count"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for smiles in iterator:
+            encoded = _encode_stamp_groups_from_smiles(rep, smiles)
+            if encoded is None:
+                continue
+            _, source_tokens, groups = encoded
+            candidates = []
+            for idx, group in enumerate(groups):
+                if min_keep_groups <= int(group.subtree_group_count) <= max_keep_groups:
+                    candidates.append((idx, int(group.subtree_group_count)))
+            if not candidates:
+                continue
+            start_idx, width = rng.choice(candidates)
+            keep_indices = list(range(int(start_idx), int(start_idx + width)))
+            row = _build_group_keep_row(rep, smiles, source_tokens, groups, keep_indices)
+            if row is None:
+                continue
+            row.update({"task": "superstructure_generation", "subtree_root_group": int(start_idx), "kept_group_count": int(width)})
+            writer.writerow(row)
+            written += 1
+    return {
+        "output_path": str(out),
+        "representation": representation,
+        "task": "superstructure_generation",
+        "n_rows": written,
+        "seed": int(seed),
+        "min_keep_groups": int(min_keep_groups),
+        "max_keep_groups": int(max_keep_groups),
+    }
+
+
+def build_scaffold_decoration_dataset(
+    smiles_list: Sequence[str],
+    output_path: str | Path,
+    representation: str = "stamp",
+    stamp_vocab: Optional[str] = None,
+    min_scaffold_heavy_atoms: int = 5,
+    max_items: Optional[int] = None,
+    show_progress: bool = True,
+) -> dict[str, Any]:
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
+    if getattr(rep, "name", "") != "stamp":
+        raise RepresentationError("Scaffold decoration dataset currently requires STAMP representation.")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    rows = smiles_list[: max_items if max_items is not None else None]
+    iterator = iterable_with_progress(rows, show_progress=show_progress, total=(min(len(smiles_list), int(max_items)) if max_items is not None else len(smiles_list)), desc="Build scaffold decoration")
+    with out.open("w", encoding="utf-8", newline="") as f:
+        fieldnames = ["source_smiles", "source_repr", "prompt_repr", "masked_repr", "target_repr", "task", "n_kept_groups", "scaffold_smiles"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for smiles in iterator:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue
+            scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+            if scaffold is None or scaffold.GetNumAtoms() == 0 or scaffold.GetNumHeavyAtoms() < int(min_scaffold_heavy_atoms):
+                continue
+            match = mol.GetSubstructMatch(scaffold)
+            if not match:
+                continue
+            scaffold_atoms = set(int(x) for x in match)
+            encoded = _encode_stamp_groups_from_smiles(rep, smiles)
+            if encoded is None:
+                continue
+            _, source_tokens, groups = encoded
+            keep_indices: list[int] = []
+            for idx, group in enumerate(groups):
+                atom_set = set(int(x) for x in group.atom_indices)
+                if atom_set and atom_set.issubset(scaffold_atoms):
+                    keep_indices.append(idx)
+            if not keep_indices:
+                for idx, group in enumerate(groups):
+                    atom_set = set(int(x) for x in group.atom_indices)
+                    if atom_set and (len(atom_set & scaffold_atoms) / max(1, len(atom_set))) >= 0.5:
+                        keep_indices.append(idx)
+            row = _build_group_keep_row(rep, smiles, source_tokens, groups, keep_indices)
+            if row is None:
+                continue
+            row.update(
+                {
+                    "task": "scaffold_decoration",
+                    "n_kept_groups": int(len(keep_indices)),
+                    "scaffold_smiles": Chem.MolToSmiles(scaffold, canonical=True, isomericSmiles=True),
+                }
+            )
+            writer.writerow(row)
+            written += 1
+    return {
+        "output_path": str(out),
+        "representation": representation,
+        "task": "scaffold_decoration",
+        "n_rows": written,
+        "min_scaffold_heavy_atoms": int(min_scaffold_heavy_atoms),
+    }
 
 
 def _init_eval_worker(representation: str) -> None:
@@ -652,6 +1369,146 @@ def build_linker_design_dataset(
     return summary
 
 
+def build_scaffold_morphing_dataset(
+    smiles_list: Sequence[str],
+    output_path: str | Path,
+    max_items: Optional[int] = None,
+    show_progress: bool = False,
+    num_workers: int = 1,
+    chunksize: int = 128,
+) -> dict[str, Any]:
+    rows = smiles_list[: max_items if max_items is not None else len(smiles_list)]
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    kept = 0
+    total = 0
+    with out.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "smiles",
+                "fragment_a",
+                "fragment_b",
+                "linker",
+                "fragment_a_ap",
+                "fragment_b_ap",
+                "linker_ap",
+            ]
+        )
+        if num_workers <= 0:
+            num_workers = max(1, os.cpu_count() or 1)
+        iterator = rows
+        if num_workers == 1:
+            iterator = iterable_with_progress(rows, show_progress=show_progress, total=len(rows), desc="Build scaffold morphing")
+            for s in iterator:
+                total += 1
+                row = _linker_row_from_smiles(s)
+                if row is None:
+                    continue
+                linker = Chem.MolFromSmiles(row[3])
+                if linker is None or not linker.GetRingInfo().NumRings():
+                    continue
+                writer.writerow(list(row))
+                kept += 1
+        else:
+            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                mapped = pool.map(_build_linker_worker, rows, chunksize=max(1, int(chunksize)))
+                mapped = iterable_with_progress(mapped, show_progress=show_progress, total=len(rows), desc="Build scaffold morphing")
+                for row in mapped:
+                    total += 1
+                    if row is None:
+                        continue
+                    linker = Chem.MolFromSmiles(row[3])
+                    if linker is None or not linker.GetRingInfo().NumRings():
+                        continue
+                    writer.writerow(list(row))
+                    kept += 1
+
+    summary = {
+        "output": str(out),
+        "task": "scaffold_morphing",
+        "total_input": total,
+        "kept": kept,
+        "keep_rate": kept / max(1, total),
+    }
+    (out.with_suffix(".summary.json")).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
+def build_linker_infill_dataset(
+    smiles_list: Sequence[str],
+    output_path: str | Path,
+    representation: str = "stamp",
+    stamp_vocab: Optional[str] = None,
+    max_items: Optional[int] = None,
+    show_progress: bool = False,
+    num_workers: int = 1,
+    chunksize: int = 128,
+    ring_only: bool = False,
+    task_name: str = "linker_design",
+) -> dict[str, Any]:
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
+    if getattr(rep, "name", "") != "stamp":
+        raise RepresentationError("Linker infill dataset currently requires STAMP representation.")
+    rows = smiles_list[: max_items if max_items is not None else len(smiles_list)]
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    total = 0
+    with out.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "source_smiles",
+                "source_repr",
+                "prompt_repr",
+                "masked_repr",
+                "target_repr",
+                "task",
+                "n_mask_groups",
+                "fragment_a_ap",
+                "fragment_b_ap",
+                "linker_ap",
+            ],
+        )
+        writer.writeheader()
+        if num_workers <= 0:
+            num_workers = max(1, os.cpu_count() or 1)
+        if num_workers == 1:
+            iterator = iterable_with_progress(rows, show_progress=show_progress, total=len(rows), desc=f"Build {task_name}")
+            for s in iterator:
+                total += 1
+                infill_row = _build_linker_group_mask_row(rep, source_smiles=s, ring_only=ring_only, task_name=task_name)
+                if infill_row is None:
+                    continue
+                writer.writerow(infill_row)
+                kept += 1
+        else:
+            with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                mapped = pool.map(_build_linker_worker, rows, chunksize=max(1, int(chunksize)))
+                mapped = iterable_with_progress(mapped, show_progress=show_progress, total=len(rows), desc=f"Build {task_name}")
+                for row in mapped:
+                    total += 1
+                    if row is None:
+                        continue
+                    infill_row = _build_linker_group_mask_row(rep, source_smiles=row[0], ring_only=ring_only, task_name=task_name)
+                    if infill_row is None:
+                        continue
+                    writer.writerow(infill_row)
+                    kept += 1
+    summary = {
+        "output_path": str(out),
+        "representation": representation,
+        "task": task_name,
+        "total_input": total,
+        "n_rows": kept,
+        "ring_only": bool(ring_only),
+    }
+    (out.with_suffix(".summary.json")).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
 def _load_scaffold_rows(path: str | Path, max_rows: Optional[int] = None) -> list[dict[str, str]]:
     out = []
     with Path(path).open("r", encoding="utf-8", newline="") as f:
@@ -667,6 +1524,121 @@ def _load_scaffold_rows(path: str | Path, max_rows: Optional[int] = None) -> lis
             if max_rows is not None and len(out) >= max_rows:
                 break
     return out
+
+
+def _load_csv_records(path: str | Path, max_rows: Optional[int] = None) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    with Path(path).open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            out.append({k: (v or "") for k, v in row.items()})
+            if max_rows is not None and len(out) >= max_rows:
+                break
+    return out
+
+
+def _sample_infill_orders(labels: torch.Tensor, random_ratio: float = 1.0) -> torch.Tensor:
+    """Observed tokens first, masked targets afterwards in random order."""
+    bsz, seqlen = labels.shape
+    device = labels.device
+    orders = torch.arange(seqlen, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, seqlen).clone()
+    for b in range(bsz):
+        masked = torch.nonzero(labels[b] != -100, as_tuple=False).squeeze(1)
+        observed = torch.nonzero(labels[b] == -100, as_tuple=False).squeeze(1)
+        if int(masked.numel()) > 1 and random.random() < random_ratio:
+            perm = torch.randperm(int(masked.numel()), device=device)
+            masked = masked[perm]
+        orders[b] = torch.cat([observed, masked], dim=0)
+    return orders
+
+
+def _compute_ao_infill_loss(
+    model: TinyDecoderLM,
+    masked_ids: torch.Tensor,
+    labels: torch.Tensor,
+    random_ratio: float = 1.0,
+) -> torch.Tensor:
+    bsz, seqlen = masked_ids.shape
+    device = masked_ids.device
+    orders = _sample_infill_orders(labels, random_ratio=random_ratio)
+    logits = model(masked_ids, orders=orders)
+    batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, seqlen)
+    targets = labels[batch_idx, orders]
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+        ignore_index=-100,
+    )
+
+
+def _tokenize_repr_space(text: str) -> list[str]:
+    return [tok for tok in str(text).split() if tok]
+
+
+def _encode_infill_records(
+    records: Sequence[dict[str, str]],
+    rep,
+    max_seq_len: int,
+) -> tuple[list[list[int]], list[list[int]], TokenVocab]:
+    masked_tok: list[list[str]] = []
+    source_tok: list[list[str]] = []
+    for row in records:
+        masked = _tokenize_repr_space(row.get("masked_repr", ""))
+        target = _tokenize_repr_space(row.get("target_repr", ""))
+        if not masked or not target:
+            continue
+        if masked.count(TokenVocab.MASK) != len(target):
+            continue
+        clean: list[str] = []
+        t_iter = iter(target)
+        labels: list[str] = []
+        for tok in masked:
+            if tok == TokenVocab.MASK:
+                tgt = next(t_iter, None)
+                if tgt is None:
+                    clean = []
+                    break
+                clean.append(tgt)
+                labels.append(tgt)
+            else:
+                clean.append(tok)
+                labels.append(TokenVocab.PAD)
+        if not clean:
+            continue
+        masked_tok.append(masked)
+        source_tok.append(clean)
+
+    motif_seed = None
+    if hasattr(rep, "codec") and getattr(rep.codec, "motif_tokenizer", None) is not None:
+        motif_seed = list(rep.codec.motif_tokenizer.idx2smi)
+    vocab = TokenVocab.build(source_tok + masked_tok, min_freq=1, add_mask_token=True, seed_tokens=motif_seed)
+
+    masked_ids: list[list[int]] = []
+    label_ids: list[list[int]] = []
+    for row in records:
+        masked = _tokenize_repr_space(row.get("masked_repr", ""))
+        target = _tokenize_repr_space(row.get("target_repr", ""))
+        if not masked or not target:
+            continue
+        if masked.count(TokenVocab.MASK) != len(target):
+            continue
+        x_ids = vocab.encode_tokens(masked)
+        labels: list[int] = []
+        t_iter = iter(vocab.encode_tokens(target))
+        for tok in masked:
+            if tok == TokenVocab.MASK:
+                tgt = next(t_iter, None)
+                if tgt is None:
+                    labels = []
+                    break
+                labels.append(int(tgt))
+            else:
+                labels.append(-100)
+        if not labels or len(labels) != len(x_ids):
+            continue
+        masked_ids.append(x_ids[:max_seq_len])
+        label_ids.append(labels[:max_seq_len])
+    return masked_ids, label_ids, vocab
 
 
 def _load_linker_rows(path: str | Path, max_rows: Optional[int] = None) -> list[dict[str, str]]:
@@ -703,14 +1675,21 @@ def train_completion_model(
     device: Optional[str] = None,
     encode_workers: int = 1,
     encode_chunksize: int = 128,
+    stamp_vocab: Optional[str] = None,
+    prompt_is_repr: bool = False,
+    target_is_repr: bool = False,
 ) -> dict[str, Any]:
-    rep = build_representation(representation)
+    rep = build_representation(representation, stamp_vocab=stamp_vocab)
     if isinstance(rep, UnsupportedRepresentation):
         raise RepresentationError(
             f"Cannot train completion model for unsupported placeholder: {representation}"
         )
 
     cfg = cfg or LMConfig()
+    model_type = _normalize_model_type(cfg.model_type)
+    if model_type not in {"decoder", "ao_gpt"}:
+        raise ValueError(f"train_completion_model only supports decoder|ao_gpt, got {cfg.model_type}")
+    cfg.model_type = model_type
     _set_seed(cfg.seed)
     dev = _resolve_torch_device(device)
 
@@ -723,10 +1702,13 @@ def train_completion_model(
     seqs = _tokenize_completion_records(
         records,
         representation=representation,
+        stamp_vocab=stamp_vocab,
         prompt_key=prompt_key,
         target_key=target_key,
         prompt_template=prompt_template,
         target_template=target_template,
+        prompt_is_repr=bool(prompt_is_repr),
+        target_is_repr=bool(target_is_repr),
         show_progress=show_progress,
         desc=f"Tokenize completion[{representation}]",
         num_workers=encode_workers,
@@ -850,8 +1832,11 @@ def train_completion_model(
                 else nullcontext()
             )
             with amp_ctx:
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-100)
+                if model_type == "ao_gpt":
+                    loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=0.9)
+                else:
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
             if use_scaler:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -876,8 +1861,11 @@ def train_completion_model(
                     else nullcontext()
                 )
                 with amp_ctx:
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-100)
+                    if model_type == "ao_gpt":
+                        loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=0.9)
+                    else:
+                        logits = model(x)
+                        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
                 valid_losses.append(float(loss.item()))
 
         tr = float(np.mean(train_losses)) if train_losses else float("nan")
@@ -894,12 +1882,20 @@ def train_completion_model(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    stamp_vocab_rel = None
+    if stamp_vocab is not None:
+        import shutil
+        dest = out_dir / "stamp_vocab.txt"
+        shutil.copy2(stamp_vocab, dest)
+        stamp_vocab_rel = "stamp_vocab.txt"
 
     torch.save(
         {
             "model_state": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
             "cfg": vars(cfg),
             "representation": representation,
+            "model_type": model_type,
+            "stamp_vocab": stamp_vocab_rel,
             "task": "completion",
         },
         out_dir / "model.pt",
@@ -918,7 +1914,10 @@ def train_completion_model(
                 "target_key": target_key,
                 "prompt_template": prompt_template,
                 "target_template": target_template,
+                "prompt_is_repr": bool(prompt_is_repr),
+                "target_is_repr": bool(target_is_repr),
                 "n_records": len(records),
+                "model_type": model_type,
                 "cfg": vars(cfg),
                 "device": str(dev),
                 "n_model_params": n_model_params,
@@ -942,6 +1941,199 @@ def _extract_completion_suffix(tokens: Sequence[str]) -> list[str]:
         return list(tokens)
     i = tokens.index("<SEP>")
     return list(tokens[i + 1 :])
+
+
+def _fill_single_mask(prompt_tokens: Sequence[str], fill_tokens: Sequence[str]) -> list[str]:
+    tokens = list(prompt_tokens)
+    if TokenVocab.MASK not in tokens:
+        return tokens + list(fill_tokens)
+    idx = tokens.index(TokenVocab.MASK)
+    return tokens[:idx] + list(fill_tokens) + tokens[idx + 1 :]
+
+
+def _sample_ao_infill_sequences(
+    model: TinyDecoderLM,
+    vocab: TokenVocab,
+    prompt_tokens: Sequence[str],
+    n_samples: int = 1,
+    temperature: float = 1.0,
+    top_k: int = 50,
+    device: Optional[torch.device] = None,
+) -> list[list[str]]:
+    dev = device or next(model.parameters()).device
+    prompt_ids = vocab.encode_tokens(list(prompt_tokens))
+    x = torch.tensor(prompt_ids, dtype=torch.long, device=dev).unsqueeze(0).repeat(n_samples, 1)
+    max_steps = int((x == vocab.mask_id).sum(dim=1).max().item())
+    if max_steps <= 0:
+        return [vocab.decode_ids(prompt_ids) for _ in range(n_samples)]
+
+    for _ in range(max_steps):
+        remaining_mask = x == vocab.mask_id
+        if not bool(remaining_mask.any().item()):
+            break
+        orders = []
+        for b in range(x.size(0)):
+            observed = torch.nonzero(~remaining_mask[b], as_tuple=False).squeeze(1)
+            masked = torch.nonzero(remaining_mask[b], as_tuple=False).squeeze(1)
+            orders.append(torch.cat([observed, masked], dim=0))
+        orders_t = torch.stack(orders, dim=0)
+        with torch.no_grad():
+            logits = model(x, orders=orders_t)
+        logits_orig = torch.empty_like(logits)
+        logits_orig.scatter_(1, orders_t.unsqueeze(-1).expand_as(logits), logits)
+        for suppressed_id in (vocab.pad_id, vocab.bos_id, vocab.mask_id, vocab.eos_id):
+            if 0 <= int(suppressed_id) < logits_orig.size(-1):
+                logits_orig[:, :, int(suppressed_id)] = float("-inf")
+        logits_orig = _apply_top_k_logits(logits_orig, top_k=top_k)
+        probs = torch.softmax(logits_orig, dim=-1)
+        conf = probs.max(dim=-1).values.masked_fill(~remaining_mask, float("-inf"))
+        next_pos = conf.argmax(dim=-1)
+        chosen_logits = logits_orig[torch.arange(x.size(0), device=dev), next_pos]
+        sampled = torch.argmax(_add_gumbel_noise(chosen_logits, temperature=temperature), dim=-1).to(dtype=torch.long)
+        x[torch.arange(x.size(0), device=dev), next_pos] = sampled
+    return [vocab.decode_ids(row) for row in x.detach().cpu().tolist()]
+
+
+def evaluate_fragment_infill(
+    model_dir: str | Path,
+    infill_csv: str | Path,
+    output_dir: str | Path,
+    max_eval: Optional[int] = 1000,
+    n_samples_per_prompt: int = 1,
+    max_new_tokens: int = 128,
+    temperature: float = 1.0,
+    top_k: int = 50,
+    show_progress: bool = True,
+    device: str | None = None,
+    eval_workers: int = 1,
+    eval_chunksize: int = 256,
+) -> dict[str, Any]:
+    model, vocab, rep, dev = load_trained_model(model_dir, device=device)
+    rows = _load_csv_records(infill_csv)
+    if max_eval is not None:
+        rows = rows[: max(1, int(max_eval))]
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    generated_rows: list[dict[str, Any]] = []
+    reconstructed_smiles: list[str] = []
+    target_smiles: list[str] = []
+
+    iterator = iterable_with_progress(rows, show_progress=show_progress, total=len(rows), desc="Eval infill")
+    for row in iterator:
+        prompt_raw = row.get("masked_repr", "")
+        target_raw = row.get("target_repr", "")
+        source_smiles = row.get("source_smiles", "")
+        task_name = row.get("task", "")
+        try:
+            prompt_tokens = _encode_completion_prompt_tokens(rep, prompt_raw, is_repr=True)
+        except Exception:
+            continue
+        seqs = _sample_ao_infill_sequences(
+            model,
+            vocab,
+            prompt_tokens=prompt_tokens,
+            n_samples=n_samples_per_prompt,
+            temperature=temperature,
+            top_k=top_k,
+            device=dev,
+        )
+        for toks in seqs:
+            full_repr = rep.detokenize(toks)
+            target_tokens = _encode_completion_target_tokens(rep, target_raw, is_repr=True)
+            prompt_toks = _encode_completion_prompt_tokens(rep, prompt_raw, is_repr=True)
+            pred_target_tokens: list[str] = []
+            for src_tok, pred_tok in zip(prompt_toks, toks):
+                if src_tok == TokenVocab.MASK:
+                    pred_target_tokens.append(pred_tok)
+            pred_repr = rep.detokenize(pred_target_tokens)
+            has_attachment_linker_fields = bool(row.get("fragment_a_ap")) and bool(row.get("fragment_b_ap")) and bool(row.get("linker_ap"))
+            if task_name in {"linker_design", "scaffold_morphing"} and has_attachment_linker_fields:
+                pred_linker = ""
+                pred_smiles = ""
+                try:
+                    pred_linker = rep.decode(pred_repr)
+                except Exception:
+                    pred_linker = ""
+                if pred_linker:
+                    pred_smiles = _assemble_labeled_linker_fragments(
+                        frag_a_ap=row.get("fragment_a_ap", ""),
+                        frag_b_ap=row.get("fragment_b_ap", ""),
+                        linker_ap=pred_linker,
+                    ) or ""
+            else:
+                try:
+                    pred_smiles = rep.decode(full_repr)
+                except Exception:
+                    pred_smiles = ""
+            generated_rows.append(
+                {
+                    "source_smiles": source_smiles,
+                    "task": task_name,
+                    "prompt_repr": prompt_raw,
+                    "target_repr": target_raw,
+                    "pred_target_repr": pred_repr,
+                    "pred_full_repr": full_repr,
+                    "pred_smiles": pred_smiles,
+                    "valid": int(bool(pred_smiles)),
+                    "exact_target_match": int(pred_repr == target_raw),
+                }
+            )
+            reconstructed_smiles.append(pred_smiles)
+            target_smiles.append(source_smiles)
+
+    canonical_pred = [canonicalize_smiles(s, require_single_component=True) if s else None for s in reconstructed_smiles]
+    canonical_target = [canonicalize_smiles(s, require_single_component=True) if s else None for s in target_smiles]
+    exact_full_match = sum(int(p is not None and p == t) for p, t in zip(canonical_pred, canonical_target))
+    metrics = evaluate_generated_smiles(
+        reconstructed_smiles,
+        train_smiles=target_smiles,
+        reference_smiles=target_smiles,
+        generated_canonical=canonical_pred,
+        assume_train_canonical=False,
+        reference_max_samples=None,
+        eval_workers=eval_workers,
+        eval_chunksize=eval_chunksize,
+    )
+    metrics.update(
+        {
+            "model_dir": str(model_dir),
+            "infill_csv": str(infill_csv),
+            "n_eval": len(generated_rows),
+            "n_samples_per_prompt": int(n_samples_per_prompt),
+            "temperature": float(temperature),
+            "top_k": int(top_k),
+            "exact_full_match_count": int(exact_full_match),
+            "exact_full_match_rate": float(exact_full_match) / max(1, len(generated_rows)),
+            "exact_target_match_rate": float(sum(int(r["exact_target_match"]) for r in generated_rows)) / max(1, len(generated_rows)),
+        }
+    )
+
+    with (out / "fragment_infill_predictions.tsv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "source_smiles",
+                "task",
+                "prompt_repr",
+                "target_repr",
+                "pred_target_repr",
+                "pred_full_repr",
+                "pred_smiles",
+                "valid",
+                "exact_target_match",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for row in generated_rows:
+            writer.writerow(row)
+
+    (out / "fragment_infill_metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return metrics
 
 
 def evaluate_scaffold_completion(

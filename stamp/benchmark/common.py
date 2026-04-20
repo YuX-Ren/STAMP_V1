@@ -21,7 +21,19 @@ def iterable_with_progress(
     return iterable
 
 
-def canonicalize_smiles(smiles: str, require_single_component: bool = False) -> str | None:
+def canonicalize_smiles(
+    smiles: str,
+    require_single_component: bool = False,
+    strip_salts: bool = False,
+) -> str | None:
+    """Canonicalize a SMILES string.
+
+    When ``strip_salts=True``, multi-component inputs (salts, hydrates,
+    counter-ion pairs) are reduced to their largest connected fragment by
+    heavy-atom count — mirroring ChEMBL / ZINC preprocessing and matching
+    STAMP's single-molecule grammar. This overrides
+    ``require_single_component`` for multi-component inputs.
+    """
     if not smiles or not smiles.strip():
         return None
     mol = Chem.MolFromSmiles(smiles)
@@ -29,8 +41,17 @@ def canonicalize_smiles(smiles: str, require_single_component: bool = False) -> 
         return None
     if mol.GetNumAtoms() == 0:
         return None
-    if require_single_component and len(Chem.GetMolFrags(mol)) != 1:
-        return None
+    if len(Chem.GetMolFrags(mol)) != 1:
+        if strip_salts:
+            try:
+                frags = Chem.GetMolFrags(mol, asMols=True)
+                mol = max(frags, key=lambda m: m.GetNumHeavyAtoms())
+            except Exception:
+                return None
+            if mol is None or mol.GetNumAtoms() == 0:
+                return None
+        elif require_single_component:
+            return None
     return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
 
 

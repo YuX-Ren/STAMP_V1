@@ -58,7 +58,7 @@ def _stamp_branch_depth_and_attachment(tokens: Sequence[str]) -> Tuple[int, int,
             frames.append(max(0, n))
             max_depth = max(max_depth, len(frames))
             continue
-        if tok in {"[END]", "[BACK]"} or tok.startswith("[S_"):
+        if tok in {"[END]", "[BACK]", "[Ring]"} or tok.startswith("[S_"):
             continue
 
         if frames:

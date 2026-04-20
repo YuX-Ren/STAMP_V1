@@ -5,3 +5,9 @@ test/
 output/
 .codex
 *.pyc
+*.pdf
+claude_resume
+data/
+logs/
+stamp_v2
+tests

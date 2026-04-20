@@ -64,8 +64,25 @@ class SMILESRepresentation(BaseRepresentation):
 class STAMPRepresentation(BaseRepresentation):
     name = "stamp"
 
-    def __init__(self) -> None:
-        self.codec = STAMPEncoder()
+    def __init__(
+        self,
+        vocab_path: str | None = None,
+        force_ring_aware_encode: bool = False,
+    ) -> None:
+        self._vocab_path = vocab_path
+        self._force_ring_aware_encode = bool(force_ring_aware_encode)
+        tokenizer = None
+        if vocab_path is not None:
+            from ..vocab.principal_subgraph import PrincipalSubgraphTokenizer
+            tokenizer = PrincipalSubgraphTokenizer(vocab_path)
+            if self._force_ring_aware_encode:
+                # Override vocab header: open ring single bonds and use the full
+                # vocab as the blessed-ring set. Common rings present in vocab
+                # are kept intact; rare rings get decomposed into known sub-
+                # fragments, so unseen scaffolds don't become a single OOV group.
+                tokenizer.allow_ring_single_edges = True
+                tokenizer.blessed_rings = set(tokenizer.vocab.keys())
+        self.codec = STAMPEncoder(motif_tokenizer=tokenizer)
 
     def encode(self, smiles: str) -> str:
         return self.codec.encode_smiles(smiles)
@@ -84,7 +101,7 @@ class STAMPRepresentation(BaseRepresentation):
 
     def is_special_token(self, token: str) -> bool:
         return (
-            token in {"[END]", "[BACK]"}
+            token in {"[END]", "[BACK]", "[Ring]"}
             or token.startswith("[J_")
             or token.startswith("[B_")
             or token.startswith("[S_")
@@ -492,12 +509,15 @@ class UnsupportedRepresentation(BaseRepresentation):
         raise RepresentationError(f"Representation `{self.name}` is a placeholder.")
 
 
-def build_representation(name: str) -> BaseRepresentation:
+def build_representation(name: str, **kwargs) -> BaseRepresentation:
     key = name.strip().lower()
     if key == "smiles":
         return SMILESRepresentation()
     if key == "stamp":
-        return STAMPRepresentation()
+        return STAMPRepresentation(
+            vocab_path=kwargs.get("stamp_vocab"),
+            force_ring_aware_encode=bool(kwargs.get("stamp_force_ring_aware_encode", False)),
+        )
     if key == "selfies":
         return SELFIESRepresentation()
     if key in {"group-selfies", "group_selfies", "groupselfies"}:

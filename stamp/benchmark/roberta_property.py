@@ -60,6 +60,14 @@ class RoBERTaConfig:
     dropout: float = 0.1
     max_seq_len: int = 512
     mask_prob: float = 0.15
+    # STAMP type-aware masking (applied only when explicitly enabled AND
+    # token-type info is passed to the dataset). Fragment tokens carry
+    # chemical identity → higher mask rate; topology tokens ([J_*],[B_*],
+    # [Ring],[END],[BACK],[S_*]) carry graph structure → lower mask rate.
+    # When both are 0, falls back to uniform ``mask_prob``.
+    type_aware_masking: bool = False
+    frag_mask_prob: float = 0.20
+    topo_mask_prob: float = 0.05
     # training
     batch_size: int = 32
     lr: float = 5e-4
@@ -81,8 +89,18 @@ class RoBERTaConfig:
 # ---------------------------------------------------------------------------
 
 class MaskedLMDataset(Dataset):
-    """Creates masked-LM samples: 15% of tokens are selected; of those 80% → [MASK],
-    10% → random token, 10% → unchanged."""
+    """Creates masked-LM samples with optional STAMP type-aware masking.
+
+    Default (``topology_ids`` None): uniform 15% mask across tokens, 80/10/10
+    scheme (ChemBERTa / BERT standard).
+
+    Type-aware mode (``topology_ids`` set provided): each position is masked
+    with per-type probability — ``frag_mask_prob`` for fragment tokens
+    (motif SMILES) and ``topo_mask_prob`` for topology tokens. Fragment tokens
+    carry chemical identity (higher signal) so we mask them more often;
+    topology tokens are highly grammar-constrained so masking them heavily
+    adds little learning signal.
+    """
 
     def __init__(
         self,
@@ -91,6 +109,9 @@ class MaskedLMDataset(Dataset):
         mask_prob: float = 0.15,
         max_seq_len: int = 512,
         seed: int = 42,
+        topology_ids: Optional[set] = None,
+        frag_mask_prob: float = 0.20,
+        topo_mask_prob: float = 0.05,
     ) -> None:
         self.samples: List[List[int]] = []
         self.vocab = vocab
@@ -98,11 +119,13 @@ class MaskedLMDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.mask_id = vocab.stoi.get("<mask>", vocab.unk_id)
         self.rng = random.Random(seed)
-        # vocab tokens eligible for random replacement (exclude specials)
         self._n_vocab = len(vocab.itos)
+        self.topology_ids: Optional[set] = set(topology_ids) if topology_ids else None
+        self.frag_mask_prob = float(frag_mask_prob)
+        self.topo_mask_prob = float(topo_mask_prob)
 
         for seq in sequences:
-            if len(seq) < 3:  # at least bos + one token + eos
+            if len(seq) < 3:
                 continue
             self.samples.append(seq[:max_seq_len])
 
@@ -113,14 +136,20 @@ class MaskedLMDataset(Dataset):
         seq = list(self.samples[idx])
         labels = [-100] * len(seq)
 
+        use_type_aware = self.topology_ids is not None
+
         for i in range(1, len(seq) - 1):  # skip bos/eos
-            if self.rng.random() < self.mask_prob:
+            if use_type_aware:
+                p = self.topo_mask_prob if seq[i] in self.topology_ids else self.frag_mask_prob
+            else:
+                p = self.mask_prob
+            if self.rng.random() < p:
                 labels[i] = seq[i]
                 r = self.rng.random()
                 if r < 0.8:
                     seq[i] = self.mask_id
                 elif r < 0.9:
-                    seq[i] = self.rng.randint(4, self._n_vocab - 1)  # random token (skip specials 0-3)
+                    seq[i] = self.rng.randint(4, self._n_vocab - 1)
                 # else: keep original
 
         return seq, labels
@@ -312,9 +341,15 @@ def pretrain_roberta(
     device: Optional[str] = None,
     encode_workers: int = 1,
     encode_chunksize: int = 128,
+    stamp_vocab: Optional[str] = None,
+    stamp_force_ring_aware_encode: bool = False,
 ) -> Dict[str, Any]:
     """Pre-train a RoBERTa MLM on molecular representations."""
-    rep = build_representation(representation)
+    rep = build_representation(
+        representation,
+        stamp_vocab=stamp_vocab,
+        stamp_force_ring_aware_encode=stamp_force_ring_aware_encode,
+    )
     if isinstance(rep, UnsupportedRepresentation):
         raise RepresentationError(
             f"Cannot pre-train RoBERTa for unsupported representation: {representation}"
@@ -351,8 +386,33 @@ def pretrain_roberta(
     train_ids = [[vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id] for toks in train_tok]
     valid_ids = [[vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id] for toks in valid_tok]
 
-    ds_train = MaskedLMDataset(train_ids, vocab, mask_prob=cfg.mask_prob, max_seq_len=cfg.max_seq_len, seed=cfg.seed)
-    ds_valid = MaskedLMDataset(valid_ids, vocab, mask_prob=cfg.mask_prob, max_seq_len=cfg.max_seq_len, seed=cfg.seed + 1)
+    topology_ids: Optional[set] = None
+    if getattr(cfg, "type_aware_masking", False):
+        topology_ids = {
+            tok_id for tok_str, tok_id in vocab.stoi.items()
+            if TokenVocab._is_stamp_structural(tok_str)
+        }
+        print(
+            f"[pretrain-roberta] type-aware masking ON: "
+            f"{len(topology_ids)} topology tokens masked at p={cfg.topo_mask_prob}, "
+            f"fragments at p={cfg.frag_mask_prob}",
+            flush=True,
+        )
+
+    ds_train = MaskedLMDataset(
+        train_ids, vocab,
+        mask_prob=cfg.mask_prob, max_seq_len=cfg.max_seq_len, seed=cfg.seed,
+        topology_ids=topology_ids,
+        frag_mask_prob=cfg.frag_mask_prob,
+        topo_mask_prob=cfg.topo_mask_prob,
+    )
+    ds_valid = MaskedLMDataset(
+        valid_ids, vocab,
+        mask_prob=cfg.mask_prob, max_seq_len=cfg.max_seq_len, seed=cfg.seed + 1,
+        topology_ids=topology_ids,
+        frag_mask_prob=cfg.frag_mask_prob,
+        topo_mask_prob=cfg.topo_mask_prob,
+    )
 
     if len(ds_train) == 0:
         raise ValueError("Training dataset is empty after tokenization.")
@@ -737,7 +797,10 @@ def _load_via_deepchem(
         rows: List[Tuple[str, float]] = []
         for i in range(len(ds)):
             smi = str(ds.ids[i])
-            can = canonicalize_smiles(smi, require_single_component=True)
+            # strip_salts=True: multi-component inputs are reduced to the
+            # largest fragment so STAMP's single-molecule grammar can handle
+            # salts/hydrates while keeping the chemically relevant moiety.
+            can = canonicalize_smiles(smi, strip_salts=True)
             if can is None:
                 continue
             y = ds.y[i]
@@ -757,15 +820,54 @@ def _load_via_deepchem(
             rows.append((can, val))
         return rows
 
+    def _extract_multitask(ds) -> List[Tuple[str, List[float]]]:
+        """Return (smiles, [y_task1, y_task2, ...]) with NaN for missing."""
+        rows: List[Tuple[str, List[float]]] = []
+        for i in range(len(ds)):
+            smi = str(ds.ids[i])
+            can = canonicalize_smiles(smi, strip_salts=True)
+            if can is None:
+                continue
+            y = ds.y[i]
+            if not hasattr(y, "__len__"):
+                y = [float(y)]
+            y_list = [float(v) for v in y]
+            rows.append((can, y_list))
+        return rows
+
     target = task_info["target_column"]
-    return {
+    # Capture any NormalizationTransformer's y_mean / y_std so downstream
+    # evaluators can un-normalize predictions and report raw-scale metrics
+    # (DeepChem defaults z-score regression labels).
+    y_mean = 0.0
+    y_std = 1.0
+    for tf in transformers or []:
+        if type(tf).__name__ == "NormalizationTransformer":
+            try:
+                y_mean = float(np.asarray(tf.y_means).flatten()[0])
+                y_std = float(np.asarray(tf.y_stds).flatten()[0])
+            except Exception:
+                pass
+            break
+
+    out = {
         "task": task_key,
         "train": _extract(train_ds, target),
         "valid": _extract(valid_ds, target),
         "test": _extract(test_ds, target),
         "task_info": task_info,
         "source": "deepchem",
+        "tasks_list": list(tasks_list) if tasks_list is not None else [],
+        "y_mean": y_mean,
+        "y_std": y_std,
     }
+    # For multi-task benchmarks (Tox21/ClinTox/SIDER/MUV/...), also expose
+    # full per-subtask labels so evaluators can compute mean AUC across all
+    # sub-tasks — matching MoleculeNet protocol used by MolCLR / Hu et al.
+    out["train_multi"] = _extract_multitask(train_ds)
+    out["valid_multi"] = _extract_multitask(valid_ds)
+    out["test_multi"] = _extract_multitask(test_ds)
+    return out
 
 
 def _load_from_local_csv(
