@@ -89,8 +89,6 @@ class STAMPRepresentation(BaseRepresentation):
 
     def decode(self, text: str) -> str:
         mol = self.codec.decode_stamp_to_mol(text)
-        if len(Chem.GetMolFrags(mol)) != 1:
-            raise RepresentationError("Decoded STAMP is disconnected (multiple fragments).")
         return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
 
     def tokenize(self, text: str) -> List[str]:
@@ -102,6 +100,7 @@ class STAMPRepresentation(BaseRepresentation):
     def is_special_token(self, token: str) -> bool:
         return (
             token in {"[END]", "[BACK]", "[Ring]"}
+            or token == "."
             or token.startswith("[J_")
             or token.startswith("[B_")
             or token.startswith("[S_")
@@ -402,12 +401,34 @@ class SAFERepresentation(BaseRepresentation):
         sys.modules["safe"] = pkg
 
     @staticmethod
-    def _load_safe_converter():
-        # Prefer official pip package if fully importable.
+    def _patch_pandas_get_adjustment() -> None:
+        # RDKit 2023.x PandasTools expects pandas.io.formats.format.get_adjustment,
+        # which moved to pandas.io.formats.printing in newer pandas releases.
         try:
-            safe_mod = importlib.import_module("safe")
-            if hasattr(safe_mod, "SAFEConverter"):
-                return safe_mod.SAFEConverter(slicer="brics", ignore_stereo=False)
+            import pandas.io.formats.format as pandas_format
+            import pandas.io.formats.printing as pandas_printing
+
+            if not hasattr(pandas_format, "get_adjustment") and hasattr(
+                pandas_printing,
+                "get_adjustment",
+            ):
+                pandas_format.get_adjustment = pandas_printing.get_adjustment
+        except Exception:
+            pass
+
+    @staticmethod
+    def _load_safe_converter():
+        # Prefer official pip package.  The package __init__ imports training
+        # utilities, which can pull in heavy/fragile optional deps, so expose
+        # the package path and import only the codec submodule.
+        try:
+            spec = importlib.util.find_spec("safe")
+            locations = list(spec.submodule_search_locations or []) if spec is not None else []
+            if locations:
+                SAFERepresentation._install_vendored_safe_package(Path(locations[0]))
+                SAFERepresentation._patch_pandas_get_adjustment()
+                converter_mod = importlib.import_module("safe.converter")
+                return converter_mod.SAFEConverter(slicer="brics", ignore_stereo=False)
         except Exception:
             pass
 
@@ -422,6 +443,7 @@ class SAFERepresentation(BaseRepresentation):
 
         try:
             SAFERepresentation._install_vendored_safe_package(vendor_pkg_root)
+            SAFERepresentation._patch_pandas_get_adjustment()
             converter_mod = importlib.import_module("safe.converter")
         except Exception as exc:
             raise RepresentationError(

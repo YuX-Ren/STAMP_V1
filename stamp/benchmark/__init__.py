@@ -20,6 +20,7 @@ from .roberta_property import (
     finetune_roberta,
     load_moleculenet_task,
     pretrain_roberta,
+    pretrain_roberta_mtr,
     run_roberta_property_benchmark,
 )
 from .tasks import (
@@ -72,6 +73,7 @@ __all__ = [
     "run_property_prediction_benchmark",
     "RoBERTaConfig",
     "pretrain_roberta",
+    "pretrain_roberta_mtr",
     "finetune_roberta",
     "load_moleculenet_task",
     "run_roberta_property_benchmark",

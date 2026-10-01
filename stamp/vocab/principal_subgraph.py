@@ -826,7 +826,7 @@ class PrincipalSubgraphTokenizer:
         self,
         mol: Chem.Mol,
         *,
-        strict_vocab: bool = True,
+        strict_vocab: bool = False,
     ) -> List[Tuple[str, List[int]]]:
         """
         Returns: ``[(canonical_fragment_smiles, atom_indices), ...]`` for the
@@ -863,7 +863,7 @@ class PrincipalSubgraphTokenizer:
         self,
         mol: Chem.Mol,
         *,
-        strict_vocab: bool = True,
+        strict_vocab: bool = False,
     ) -> List[List[int]]:
         groups = self.decompose_with_smis(mol, strict_vocab=strict_vocab)
         return [idxs for _, idxs in groups]
@@ -872,7 +872,7 @@ class PrincipalSubgraphTokenizer:
         self,
         smiles: str,
         *,
-        strict_vocab: bool = True,
+        strict_vocab: bool = False,
     ) -> List[List[int]]:
         mol = smi2mol(smiles, kekulize=self.kekulize)
         if mol is None:

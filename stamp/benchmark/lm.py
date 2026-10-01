@@ -53,6 +53,9 @@ class LMConfig:
     diffusion_tokens_per_step: int = 0
     diffusion_chemical_role_masking: bool = False
     diffusion_structure_constraints: bool = False
+    # When False, skip AdaLN modulation and the none_emb/target_pos_emb machinery
+    # used by AO-GPT. Standard masked-diffusion (MDM/MDLM) sets this to False.
+    use_adaln: bool = True
     # ao_gpt_pp (property-prediction) type-aware masking. Only consulted when
     # model_type == "ao_gpt_pp"; the plain "ao_gpt" path ignores these.
     ao_pp_frag_mask_rate: float = 0.20
@@ -64,6 +67,14 @@ class LMConfig:
     ao_pp_mix_uniform: float = 0.50
     ao_pp_mix_type_aware: float = 0.40
     ao_pp_mix_identity: float = 0.10
+    # AO-GPT training: fraction of batches that use a RANDOM AO permutation
+    # (vs identity). Default 0.9 = mostly random orders (the prior recipe).
+    # Set to 0 to train purely as AR (matches AR inference, recommended for
+    # downstream tasks where generation is left-to-right).
+    ao_random_ratio: float = 0.9
+    # Tie input token embedding with output head weight. Standard for modern
+    # LMs; saves vocab*d_model params (e.g. 51K*1024 = 52M for d=1024).
+    tied_embeddings: bool = False
 
 
 class TokenVocab:
@@ -236,6 +247,149 @@ def build_dynamic_denoise_collate_fn(
 _ADALN_COND_DIM = 128
 
 
+# ============================================================================
+# Llama-style AR GPT — clean baseline for left-to-right AR training.
+# No AO-GPT machinery (target_pos_emb, AdaLN, shuffle, none_emb). Uses RoPE,
+# RMSNorm, SwiGLU FFN, tied embeddings, no biases. Use cfg.model_type='llama'.
+# ============================================================================
+
+
+def _precompute_rope_freqs(d_head: int, max_seq_len: int, base: float = 10000.0,
+                          dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (cos, sin) of shape (max_seq_len, d_head)."""
+    inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2, dtype=torch.float32) / d_head))
+    t = torch.arange(max_seq_len, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    # duplicate to full d_head (interleaved chunks for [x1; x2] rotation)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """x: (B, H, T, D). cos/sin: (T, D). Apply RoPE rotation."""
+    T = x.size(-2)
+    cos_t = cos[:T].to(x.dtype).unsqueeze(0).unsqueeze(0)  # (1,1,T,D)
+    sin_t = sin[:T].to(x.dtype).unsqueeze(0).unsqueeze(0)
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat([-x2, x1], dim=-1)
+    return x * cos_t + rotated * sin_t
+
+
+class _LlamaAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.d_model = d_model
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
+        self.q_norm = _RMSNorm(self.d_head)
+        self.k_norm = _RMSNorm(self.d_head)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.size()
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        q, k = self.q_norm(q), self.k_norm(k)
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_dropout(self.out(y))
+
+
+class _LlamaSwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+
+
+class _LlamaBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float) -> None:
+        super().__init__()
+        self.attn_norm = _RMSNorm(d_model)
+        self.attn = _LlamaAttention(d_model, n_heads, dropout)
+        self.ffn_norm = _RMSNorm(d_model)
+        self.ffn = _LlamaSwiGLU(d_model, d_ff, dropout)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), cos, sin)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+class LlamaDecoderLM(nn.Module):
+    """Clean Llama-style AR GPT: RoPE + RMSNorm + SwiGLU + tied embeddings,
+    no biases. Standard left-to-right causal attention. Use this for AR
+    training/inference; far simpler than the AO-GPT TinyDecoderLM and
+    eliminates the train↔inference paradigm mismatch (random AO orders during
+    training vs identity AR at inference)."""
+
+    def __init__(self, vocab_size: int, cfg: LMConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.vocab_size = vocab_size
+        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([
+            _LlamaBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+            for _ in range(cfg.n_layers)
+        ])
+        self.norm = _RMSNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        # Tied embeddings (Llama / GPT-2 default)
+        self.head.weight = self.tok_emb.weight
+        # RoPE freqs
+        cos, sin = _precompute_rope_freqs(cfg.d_model // cfg.n_heads, cfg.max_seq_len)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith(("out.weight", "down_proj.weight")):
+                nn.init.trunc_normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers), a=-0.06, b=0.06)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
+
+    def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
+        """AR forward. Ignores `orders` kwarg if passed (Llama is pure AR)."""
+        B, T = input_ids.shape
+        if T > self.cfg.max_seq_len:
+            raise ValueError(f"sequence length {T} exceeds max_seq_len={self.cfg.max_seq_len}")
+        x = self.drop(self.tok_emb(input_ids))
+        for block in self.blocks:
+            x = block(x, self.rope_cos, self.rope_sin)
+        x = self.norm(x)
+        return self.head(x)
+
+
+def _compute_ar_loss(model, clean_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Standard next-token CE for AR LM. labels has -100 at positions to ignore
+    (PAD, BOS already shifted out by the data pipeline)."""
+    logits = model(clean_ids)
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1 + scale) + shift
 
@@ -260,21 +414,31 @@ class _SelfAttention(nn.Module):
         self.q_norm = _RMSNorm(d_model // n_heads)
         self.k_norm = _RMSNorm(d_model // n_heads)
 
-    def forward(self, x: torch.Tensor, is_causal: bool) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        is_causal: bool,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.d_model, dim=2)
         q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
         k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
         v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
         q, k = self.q_norm(q), self.k_norm(k)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=is_causal)
+        if attn_mask is not None:
+            # explicit boolean mask overrides is_causal
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0, is_causal=False)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=is_causal)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
 
 
 class _AOBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float) -> None:
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float, use_adaln: bool = True) -> None:
         super().__init__()
+        self.use_adaln = use_adaln
         self.ln_1 = _RMSNorm(d_model)
         self.attn = _SelfAttention(d_model, n_heads, dropout)
         self.ln_2 = _RMSNorm(d_model)
@@ -282,24 +446,39 @@ class _AOBlock(nn.Module):
             nn.Linear(d_model, d_ff, bias=True), nn.GELU(),
             nn.Linear(d_ff, d_model, bias=True), nn.Dropout(dropout),
         )
-        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(_ADALN_COND_DIM, 6 * d_model, bias=True))
+        if use_adaln:
+            self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(_ADALN_COND_DIM, 6 * d_model, bias=True))
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor, is_causal: bool) -> torch.Tensor:
-        s_a, sc_a, g_a, s_m, sc_m, g_m = self.adaLN(cond).chunk(6, dim=-1)
-        x = x + g_a * self.attn(_modulate(self.ln_1(x), s_a, sc_a), is_causal=is_causal)
-        x = x + g_m * self.mlp(_modulate(self.ln_2(x), s_m, sc_m))
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: Optional[torch.Tensor],
+        is_causal: bool,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.use_adaln:
+            s_a, sc_a, g_a, s_m, sc_m, g_m = self.adaLN(cond).chunk(6, dim=-1)
+            x = x + g_a * self.attn(_modulate(self.ln_1(x), s_a, sc_a), is_causal=is_causal, attn_mask=attn_mask)
+            x = x + g_m * self.mlp(_modulate(self.ln_2(x), s_m, sc_m))
+        else:
+            x = x + self.attn(self.ln_1(x), is_causal=is_causal, attn_mask=attn_mask)
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 
 class _AOFinalLayer(nn.Module):
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, use_adaln: bool = True) -> None:
         super().__init__()
+        self.use_adaln = use_adaln
         self.ln_f = _RMSNorm(d_model)
-        self.adaLN_final = nn.Sequential(nn.SiLU(), nn.Linear(_ADALN_COND_DIM, 2 * d_model, bias=True))
+        if use_adaln:
+            self.adaLN_final = nn.Sequential(nn.SiLU(), nn.Linear(_ADALN_COND_DIM, 2 * d_model, bias=True))
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.adaLN_final(cond).chunk(2, dim=-1)
-        return _modulate(self.ln_f(x), shift, scale)
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.use_adaln:
+            shift, scale = self.adaLN_final(cond).chunk(2, dim=-1)
+            return _modulate(self.ln_f(x), shift, scale)
+        return self.ln_f(x)
 
 
 class TinyDecoderLM(nn.Module):
@@ -307,13 +486,19 @@ class TinyDecoderLM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.bidirectional = bidirectional
+        self.use_adaln = bool(getattr(cfg, "use_adaln", True))
         self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len + 1, cfg.d_model)
-        self.target_pos_emb = nn.Embedding(cfg.max_seq_len, _ADALN_COND_DIM)
-        self.none_emb = nn.Embedding(1, cfg.d_model)
+        pos_len = cfg.max_seq_len + 1 if self.use_adaln else cfg.max_seq_len
+        self.pos_emb = nn.Embedding(pos_len, cfg.d_model)
+        if self.use_adaln:
+            self.target_pos_emb = nn.Embedding(cfg.max_seq_len, _ADALN_COND_DIM)
+            self.none_emb = nn.Embedding(1, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([_AOBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout) for _ in range(cfg.n_layers)])
-        self.final_layer = _AOFinalLayer(cfg.d_model)
+        self.blocks = nn.ModuleList([
+            _AOBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, use_adaln=self.use_adaln)
+            for _ in range(cfg.n_layers)
+        ])
+        self.final_layer = _AOFinalLayer(cfg.d_model, use_adaln=self.use_adaln)
         self.head = nn.Linear(cfg.d_model, vocab_size, bias=True)
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -340,6 +525,18 @@ class TinyDecoderLM(nn.Module):
         if t > self.cfg.max_seq_len:
             raise ValueError(f"sequence length {t} exceeds max_seq_len={self.cfg.max_seq_len}")
 
+        use_causal = bool(force_causal or not self.bidirectional)
+
+        if not self.use_adaln:
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
+            tok_emb = self.tok_emb(input_ids)
+            pos_emb = self.pos_emb(pos).unsqueeze(0).expand(bsz, -1, -1)
+            x = self.drop(tok_emb + pos_emb)
+            for block in self.blocks:
+                x = block(x, None, is_causal=use_causal)
+            x = self.final_layer(x, None)
+            return self.head(x)
+
         pos = torch.arange(0, t + 1, dtype=torch.long, device=device)
 
         if orders is None:
@@ -360,7 +557,6 @@ class TinyDecoderLM(nn.Module):
         target_cond = torch.cat([tpe_zeros, tpe_shuffled], dim=1)
 
         x = self.drop(tok_emb + torch.cat([pos_emb_prefix, pos_emb_postfix], dim=1))
-        use_causal = bool(force_causal or not self.bidirectional)
 
         for block in self.blocks:
             x = block(x, target_cond, is_causal=use_causal)
@@ -368,6 +564,204 @@ class TinyDecoderLM(nn.Module):
         x = self.final_layer(x, target_cond)
         logits = self.head(x)
         return logits[:, 1:, :]
+
+
+def _block_diff_mask(n: int, device: torch.device) -> torch.Tensor:
+    """Block_diff attention mask for Eso-LM sequential branch (block_size=1).
+
+    Operates on a concatenated [zt, x0] sequence of length 2n. Each zt query
+    attends to (i) itself (block_diagonal), (ii) x0 positions strictly earlier
+    in sort order (offset_block_causal). Each x0 query attends causally to
+    itself and earlier x0 positions (block_causal). x0 positions never attend
+    to zt positions. Returns a bool tensor of shape [2n, 2n].
+    """
+    total = 2 * n
+    q_idx = torch.arange(total, device=device).unsqueeze(1)  # [2n, 1]
+    kv_idx = torch.arange(total, device=device).unsqueeze(0)  # [1, 2n]
+    x0_flag_q = q_idx >= n
+    x0_flag_kv = kv_idx >= n
+    block_q = torch.where(x0_flag_q, q_idx - n, q_idx)
+    block_kv = torch.where(x0_flag_kv, kv_idx - n, kv_idx)
+    block_diagonal = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+    offset_block_causal = (block_q > block_kv) & x0_flag_kv & (~x0_flag_q)
+    block_causal = (block_q >= block_kv) & x0_flag_kv & x0_flag_q
+    return (block_diagonal | offset_block_causal | block_causal)
+
+
+class TinyEsoDiT(nn.Module):
+    """Eso-LM backbone (arXiv 2506.01928).
+
+    Sequential branch (used when some positions are kept clean, alpha_0 < 1):
+      input = concat([zt_sorted, x0_sorted]) of length 2n
+      attention = block_diff_mask (block_size=1)
+        - zt[q] sees self + x0[0..q-1]
+        - x0[q] sees causally over x0 half only
+      output = logits at first n positions (zt positions)
+
+    Diffusion branch (alpha_0 = 1, pure MDM):
+      input = zt_sorted of length n
+      attention = bidirectional
+      output = logits [B, n, V]
+
+    Positional embeddings are learned and gathered by sort_idx so that each
+    sorted position carries its original-layout positional signature. The
+    zt and x0 halves share the same per-position pos embs.
+    """
+
+    def __init__(self, vocab_size: int, cfg: LMConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([
+            _AOBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, use_adaln=False)
+            for _ in range(cfg.n_layers)
+        ])
+        self.final_norm = _RMSNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, vocab_size, bias=True)
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                nn.init.trunc_normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers), a=-0.06, b=0.06)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
+
+    def forward(
+        self,
+        zt: torch.Tensor,
+        x0: Optional[torch.Tensor],
+        sort_idx: torch.Tensor,
+        mode: str = "sequential",
+    ) -> torch.Tensor:
+        device = zt.device
+        B, n = zt.shape
+        if n > self.cfg.max_seq_len:
+            raise ValueError(f"sequence length {n} exceeds max_seq_len={self.cfg.max_seq_len}")
+
+        pos_ids = sort_idx  # [B, n]; each position carries its original index's pos_emb
+        pos_embs = self.pos_emb(pos_ids)  # [B, n, d]
+
+        if mode == "diffusion":
+            tok = self.tok_emb(zt) + pos_embs
+            x = self.drop(tok)
+            for block in self.blocks:
+                # bidirectional: pass a 1 mask (all-True = bidirectional) or skip via is_causal=False
+                x = block(x, cond=None, is_causal=False, attn_mask=None)
+            x = self.final_norm(x)
+            return self.head(x)
+
+        # sequential mode: concat [zt, x0], run block_diff_mask attention
+        if x0 is None:
+            raise ValueError("sequential mode requires x0")
+        tok_zt = self.tok_emb(zt) + pos_embs
+        tok_x0 = self.tok_emb(x0) + pos_embs
+        x = self.drop(torch.cat([tok_zt, tok_x0], dim=1))  # [B, 2n, d]
+
+        attn_mask = _block_diff_mask(n, device=device)  # [2n, 2n] bool
+        # Expand for SDPA: broadcasting handles batch+heads
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, 2n, 2n]
+
+        for block in self.blocks:
+            x = block(x, cond=None, is_causal=False, attn_mask=attn_mask)
+        x = self.final_norm(x)
+        logits = self.head(x)
+        return logits[:, :n, :]  # first half = zt positions
+
+
+def _compute_sort_idx(
+    xt: torch.Tensor,
+    mask_id: int,
+    shuffle_unmasked: bool = False,
+) -> torch.Tensor:
+    """Compute sort index so unmasked tokens come first (shuffled or sequential)
+    and masked tokens come last in sequential order within each row (per the
+    official Eso-LM sort_indices algorithm)."""
+    B, n = xt.shape
+    device = xt.device
+    masked = (xt == mask_id)
+    if shuffle_unmasked:
+        offsets = torch.rand((B, n), device=device) * 0.9
+    else:
+        offsets = torch.linspace(0.0, 0.9, n, device=device).unsqueeze(0).expand(B, n).clone()
+    # Masks get a monotone offset in [0, 1] so they sort after the unmasked block
+    # (which has offset < 0.9). Within each row, earlier masked indices get
+    # smaller offsets so they end up sequentially at the tail.
+    total_masked = int(masked.sum().item())
+    if total_masked > 0:
+        linspace = torch.linspace(0.0, 1.0, total_masked, device=device)
+        offsets_flat = offsets.reshape(-1).clone()
+        masked_flat = masked.reshape(-1)
+        offsets_flat[masked_flat] = linspace
+        offsets = offsets_flat.view(B, n)
+    keys = masked.to(torch.float32) + offsets
+    return keys.argsort(dim=-1).to(torch.long)
+
+
+def _compute_eso_loss_v2(
+    model: TinyEsoDiT,
+    x0: torch.Tensor,
+    labels: torch.Tensor,
+    cfg: LMConfig,
+    mask_id: int,
+    alpha_0: float = 0.0,
+    shuffle_unmasked: bool = False,
+) -> torch.Tensor:
+    """Full Eso-LM sequential-branch training loss (mirrors the official
+    `_reconstruction_loss`).
+
+    Uses fixed alpha_0 as the mask rate boundary (NOT a sampled t). With
+    prob (1 - alpha_0), each position is masked in zt. Sort so unmasked
+    tokens come first (shuffled or sequential) and masked tokens come last
+    in sequential order. Forward through TinyEsoDiT with block_diff_mask
+    attention over [zt, x0]. Zero-mask trick suppresses mask_id in the head
+    output. Loss is raw NLL (no scheduler weight) at masked positions only.
+    """
+    B, n = x0.shape
+    device = x0.device
+
+    maskable = labels != -100
+
+    # At alpha_0 mask rate: each maskable position is masked independently
+    # with probability (1 - alpha_0). alpha_0 = 0 -> all masked (pure AR),
+    # alpha_0 = 0.5 -> half masked, etc.
+    p_mask = float(1.0 - alpha_0)
+    mask_draw = (torch.rand((B, n), device=device) < p_mask) & maskable
+
+    # Force at least one mask per row that has maskable positions
+    any_maskable = maskable.any(dim=1)
+    any_masked = mask_draw.any(dim=1)
+    need_fix = any_maskable & (~any_masked)
+    if bool(need_fix.any().item()):
+        row_idx = torch.where(need_fix)[0]
+        first_pos = torch.argmax(maskable[row_idx].to(torch.float32), dim=1)
+        mask_draw[row_idx, first_pos] = True
+
+    xt = torch.where(mask_draw, torch.full_like(x0, mask_id), x0)
+
+    sort_idx = _compute_sort_idx(xt, mask_id, shuffle_unmasked=shuffle_unmasked)
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, n)
+    zt = xt[batch_idx, sort_idx]
+    x0_sorted = x0[batch_idx, sort_idx]
+
+    logits = model(zt, x0=x0_sorted, sort_idx=sort_idx, mode="sequential")
+    # Zero-mask trick
+    neg_inf = torch.finfo(logits.dtype).min / 2
+    logits = logits.clone()
+    logits[..., mask_id] = neg_inf
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll = -log_probs.gather(-1, x0_sorted.unsqueeze(-1)).squeeze(-1)  # [B, n]
+
+    loss_mask = (zt == mask_id).to(nll.dtype)
+    denom = loss_mask.sum().clamp_min(1.0)
+    return (nll * loss_mask).sum() / denom
 
 
 def _timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10_000) -> torch.Tensor:
@@ -676,8 +1070,8 @@ def _ids_with_special_tokens(tokenized: Sequence[Sequence[str]], vocab: TokenVoc
 
 def _normalize_model_type(model_type: str) -> str:
     mt = (model_type or "decoder").strip().lower()
-    if mt not in {"decoder", "diffusion", "ao_gpt", "ao_gpt_pp"}:
-        raise ValueError(f"Unsupported model_type: {model_type}. Expected one of: decoder, diffusion, ao_gpt, ao_gpt_pp")
+    if mt not in {"decoder", "diffusion", "ao_gpt", "ao_gpt_pp", "eso", "eso_v2", "llama"}:
+        raise ValueError(f"Unsupported model_type: {model_type}. Expected one of: decoder, diffusion, ao_gpt, ao_gpt_pp, eso, eso_v2, llama")
     return mt
 
 
@@ -714,27 +1108,40 @@ def _compute_ao_gpt_loss(
 def _sample_ao_orders(labels: torch.Tensor, random_ratio: float = 0.9) -> torch.Tensor:
     """Sample AO-GPT permutations over valid positions only.
 
-    The first valid position stays first so BOS context is always available.
-    The last valid position stays last so EOS prediction remains aligned with
-    left-to-right decoding. Ignored/padded positions are appended unchanged.
+    First valid stays first (BOS context), last valid stays last (EOS aligned
+    with left-to-right decoding), middle valids are uniformly shuffled, and
+    ignored (-100) positions are appended in their original order.
+
+    Fully vectorized argsort-based impl: O(1) Python, no per-row launches.
     """
     bsz, seqlen = labels.shape
     device = labels.device
-    base_order = torch.arange(seqlen, device=device, dtype=torch.long)
-    orders = base_order.unsqueeze(0).expand(bsz, seqlen).clone()
+    valid_mask = labels != -100                                   # (bsz, seq)
+    n_valid = valid_mask.sum(dim=-1)                              # (bsz,)
 
-    for b in range(bsz):
-        valid = torch.nonzero(labels[b] != -100, as_tuple=False).squeeze(1)
-        invalid = torch.nonzero(labels[b] == -100, as_tuple=False).squeeze(1)
-        if int(valid.numel()) <= 2 or random.random() >= random_ratio:
-            valid_order = valid
-        else:
-            middle = valid[1:-1]
-            perm = torch.randperm(int(middle.numel()), device=device)
-            valid_order = torch.cat([valid[:1], middle[perm], valid[-1:]], dim=0)
-        full_order = torch.cat([valid_order, invalid], dim=0)
-        orders[b] = full_order
-    return orders
+    # Per-row: permute vs identity (matches original random.random() per row,
+    # and the "<=2 valid" fallback to identity).
+    gate = (torch.rand(bsz, device=device) < float(random_ratio)) & (n_valid > 2)
+
+    # Base keys: uniform [0,1) for valid, [3 + i/seqlen) for invalid — invalids
+    # share the tail and preserve original-index order via the monotone offset.
+    rand_keys = torch.rand(bsz, seqlen, device=device)
+    pad_keys = 3.0 + torch.arange(seqlen, device=device, dtype=rand_keys.dtype) / float(max(1, seqlen))
+    keys = torch.where(valid_mask, rand_keys, pad_keys.unsqueeze(0).expand(bsz, -1))
+
+    # Pin first valid to -1.0 (sorts first) and last valid to 2.0 (sorts after
+    # the random middle keys but before invalid tail).
+    first_idx = valid_mask.to(torch.int32).argmax(dim=-1)         # (bsz,)
+    last_idx = (seqlen - 1) - valid_mask.flip(-1).to(torch.int32).argmax(dim=-1)
+    rows = torch.arange(bsz, device=device)
+    keys[rows, first_idx] = -1.0
+    keys[rows, last_idx] = 2.0
+
+    # Rows that don't permute: collapse to identity order via ascending keys.
+    identity_keys = torch.arange(seqlen, device=device, dtype=keys.dtype).unsqueeze(0).expand(bsz, -1)
+    keys = torch.where(gate.unsqueeze(-1), keys, identity_keys)
+
+    return keys.argsort(dim=-1).to(torch.long)
 
 
 def _sample_ao_orders_type_aware(
@@ -911,6 +1318,80 @@ def _compute_diffusion_loss(
     return token_nll.sum() / masked_mask.sum().clamp_min(1)
 
 
+def _compute_eso_loss(
+    model: TinyDecoderLM,
+    clean_ids: torch.Tensor,
+    labels: torch.Tensor,
+    cfg: LMConfig,
+    mask_id: int,
+    random_ratio: float = 0.9,
+    ar_frac: float = 0.5,
+) -> torch.Tensor:
+    """Eso-LM loss mixing AR (alpha_0=0) and MDM (alpha_0=1) per batch.
+
+    With probability ``ar_frac``, runs the AO-GPT objective (next-token CE on
+    clean tokens along a random order -- equivalent to Eso-LM at alpha_0=0).
+    Otherwise runs the MDM-under-shuffled-causal objective: sample a random
+    time t, mask some positions, predict masked tokens from causal predecessors
+    in the shuffled order, weighted by ``alpha'_t / (1 - alpha_t)``.
+
+    The AR branch is equivalent to AO-GPT on the same data; mixing both
+    regimes lets the shared TinyDecoderLM handle alpha_0 continuously at
+    inference time.
+    """
+    bsz, seqlen = clean_ids.shape
+    device = clean_ids.device
+
+    do_ar = (ar_frac >= 1.0) or (ar_frac > 0.0 and bool(torch.rand(1, device=device).item() < ar_frac))
+    orders = _sample_ao_orders(labels, random_ratio=random_ratio)
+    batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, seqlen)
+
+    if do_ar:
+        logits = model(clean_ids, orders=orders)
+        targets_shuf = labels[batch_idx, orders]
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets_shuf.reshape(-1),
+            ignore_index=-100,
+        )
+
+    # MDM branch
+    maskable_mask = labels != -100
+    t = cfg.diffusion_time_epsilon + (1.0 - cfg.diffusion_time_epsilon) * torch.rand(
+        bsz, device=device
+    )
+    p_mask = 1.0 - _alpha_from_t(t, scheduler=cfg.diffusion_scheduler)
+    masked_mask = (
+        torch.rand((bsz, seqlen), device=device) < p_mask.unsqueeze(1)
+    ) & maskable_mask
+
+    if not bool(masked_mask.any().item()):
+        any_maskable = maskable_mask.any(dim=1)
+        if bool(any_maskable.any().item()):
+            row_idx = torch.where(any_maskable)[0]
+            first_pos = torch.argmax(
+                maskable_mask[row_idx].to(dtype=torch.float32), dim=1
+            )
+            masked_mask[row_idx, first_pos] = True
+
+    noised_ids = torch.where(masked_mask, torch.full_like(clean_ids, mask_id), clean_ids)
+    logits = model(noised_ids, orders=orders)
+    targets_shuf = clean_ids[batch_idx, orders]
+    masked_shuf = masked_mask[batch_idx, orders]
+    token_nll = F.cross_entropy(logits.transpose(1, 2), targets_shuf, reduction="none")
+
+    weight_mode = (cfg.diffusion_loss_weight or "scheduler").strip().lower()
+    if weight_mode == "scheduler":
+        loss_weights = _alpha_weight_from_t(t, scheduler=cfg.diffusion_scheduler).unsqueeze(1).expand_as(token_nll)
+    elif weight_mode == "uniform":
+        loss_weights = torch.ones_like(token_nll)
+    else:
+        raise ValueError(f"Unsupported diffusion_loss_weight: {cfg.diffusion_loss_weight}")
+
+    token_nll = token_nll * masked_shuf.to(dtype=token_nll.dtype) * loss_weights
+    return token_nll.sum() / masked_shuf.sum().clamp_min(1)
+
+
 def train_language_model(
     train_smiles: Sequence[str],
     valid_smiles: Sequence[str],
@@ -1070,6 +1551,10 @@ def train_language_model(
     if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
         model: LMModel = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
     else:
+        # Standard MDLM denoiser: bidirectional attention, no AdaLN/target-pos
+        # conditioning, no none_emb prefix. Force cfg.use_adaln=False so the
+        # arch matches standard MDM transformers.
+        cfg.use_adaln = False
         model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=True)
 
     if init_from is not None:
@@ -1203,7 +1688,7 @@ def train_language_model(
                     logits = model(x)  # type: ignore[operator]
                     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
                 elif model_type == "ao_gpt":
-                    loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=0.9)
+                    loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=cfg.ao_random_ratio)
                 elif model_type == "ao_gpt_pp":
                     loss = _compute_ao_gpt_pp_loss(model, x, y, cfg, _topology_id_tensor)
                 else:
@@ -1244,7 +1729,7 @@ def train_language_model(
                         logits = model(x)  # type: ignore[operator]
                         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
                     elif model_type == "ao_gpt":
-                        loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=0.9)
+                        loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=cfg.ao_random_ratio)
                     elif model_type == "ao_gpt_pp":
                         loss = _compute_ao_gpt_pp_loss(model, x, y, cfg, _topology_id_tensor)
                     else:
@@ -1345,9 +1830,15 @@ def load_trained_model(
     rep_name = ckpt["representation"]
 
     vocab = TokenVocab.from_dict(json.loads(vocab_path.read_text(encoding="utf-8")))
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
-        model: LMModel = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
+    if model_type == "llama":
+        model: LMModel = LlamaDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
+    elif model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
+        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
     else:
+        # Standard MDLM denoiser: bidirectional attention, no AdaLN/target-pos
+        # conditioning, no none_emb prefix. Force cfg.use_adaln=False so the
+        # arch matches standard MDM transformers.
+        cfg.use_adaln = False
         model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=True)
     state_dict = ckpt["model_state"]
     if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
@@ -1371,21 +1862,57 @@ def load_trained_model(
     return model, vocab, rep, dev
 
 
-def _sample_next_tokens(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0) -> torch.Tensor:
+def _sample_next_tokens(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 0.0,
+    typical_p: float = 0.0,
+) -> torch.Tensor:
+    """Temperature + top-k + top-p (nucleus) + typical sampling.
+
+    Order of filters: top-k first, then top-p, then typical.
+    - top_p: keep smallest prefix (descending prob) with cumulative prob >= top_p.
+    - typical_p: locally typical sampling (Meister et al. 2023). Sort tokens by
+      |I(w) - H(p)| ascending (most typical first), keep smallest prefix with
+      cumulative prob >= typical_p. Pass 0 to disable.
+    """
     if temperature <= 0:
         temperature = 1.0
     logits = logits / temperature
 
     if top_k > 0:
         k = min(top_k, logits.size(-1))
-        v, idx = torch.topk(logits, k=k, dim=-1)
-        probs = torch.softmax(v, dim=-1)
-        rel = torch.multinomial(probs, num_samples=1)
-        token = idx.gather(1, rel).squeeze(1)
-    else:
-        probs = torch.softmax(logits, dim=-1)
-        token = torch.multinomial(probs, num_samples=1).squeeze(1)
+        logits = _apply_top_k_logits(logits, top_k=k)
 
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove_sorted = cumulative - sorted_probs >= top_p
+        remove_sorted[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove_sorted, float("-inf"))
+        logits = torch.full_like(logits, float("-inf"))
+        logits.scatter_(-1, sorted_idx, sorted_logits)
+
+    if 0.0 < typical_p < 1.0:
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        # Entropy per row; mask NaN from -inf*0 contributions.
+        entropy = -(probs * log_probs).nansum(dim=-1, keepdim=True)
+        # Signed deviation |I(w) - H(p)| = |-log p(w) - H(p)|
+        shifted = ((-log_probs) - entropy).abs()
+        sorted_shifted, sorted_idx = torch.sort(shifted, dim=-1)  # ascending
+        sorted_probs = probs.gather(-1, sorted_idx)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove_sorted = cumulative - sorted_probs >= typical_p
+        remove_sorted[..., 0] = False  # always keep most-typical token
+        remove = torch.zeros_like(logits, dtype=torch.bool)
+        remove.scatter_(-1, sorted_idx, remove_sorted)
+        logits = logits.masked_fill(remove, float("-inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    token = torch.multinomial(probs, num_samples=1).squeeze(1)
     return token
 
 
@@ -1541,6 +2068,8 @@ def _sample_model_sequences_decoder(
     max_new_tokens: int = 256,
     temperature: float = 1.0,
     top_k: int = 50,
+    top_p: float = 0.0,
+    typical_p: float = 0.0,
     prompt_tokens: Optional[Sequence[str]] = None,
     device: Optional[torch.device] = None,
 ) -> List[List[str]]:
@@ -1570,7 +2099,9 @@ def _sample_model_sequences_decoder(
         for suppressed_id in (vocab.pad_id, vocab.bos_id, vocab.mask_id):
             if 0 <= int(suppressed_id) < logits.size(-1):
                 logits[:, int(suppressed_id)] = float("-inf")
-        next_ids = _sample_next_tokens(logits, temperature=temperature, top_k=top_k)
+        next_ids = _sample_next_tokens(
+            logits, temperature=temperature, top_k=top_k, top_p=top_p, typical_p=typical_p,
+        )
         eos_fill = torch.full_like(next_ids, vocab.eos_id)
         next_ids = torch.where(finished, eos_fill, next_ids)
         ids = torch.cat([ids, next_ids.unsqueeze(1)], dim=1)
@@ -1753,7 +2284,7 @@ def _sample_model_sequences_diffusion(
     if total_len <= 0:
         return [[] for _ in range(n_samples)]
 
-    x = torch.full((n_samples, total_len), vocab.eos_id, dtype=torch.long, device=dev)
+    x = torch.full((n_samples, total_len), vocab.pad_id, dtype=torch.long, device=dev)
     x[:, : len(prefix)] = torch.tensor(prefix, dtype=torch.long, device=dev).unsqueeze(0).repeat(n_samples, 1)
     if max_new_tokens > 0:
         x[:, len(prefix) :] = vocab.mask_id
@@ -1802,7 +2333,9 @@ def _sample_model_sequences_diffusion(
                     break
                 with torch.no_grad():
                     logits = model(x)
-                for suppressed_id in (vocab.pad_id, vocab.bos_id, vocab.mask_id, vocab.eos_id):
+                # Allow EOS (model must learn to terminate sequences). Still
+                # suppress PAD/BOS/MASK/UNK which are never valid outputs.
+                for suppressed_id in (vocab.pad_id, vocab.bos_id, vocab.mask_id, vocab.unk_id):
                     if 0 <= int(suppressed_id) < logits.size(-1):
                         logits[:, :, suppressed_id] = float("-inf")
                 if bool(getattr(model.cfg, "diffusion_structure_constraints", False)):
@@ -1840,7 +2373,7 @@ def _sample_model_sequences_diffusion(
 
                 x[transfer_index] = x0[transfer_index]
 
-    x = torch.where(x == vocab.mask_id, torch.full_like(x, vocab.eos_id), x)
+    x = torch.where(x == vocab.mask_id, torch.full_like(x, vocab.pad_id), x)
     out: List[List[str]] = []
     all_ids = x[:, 1:].detach().cpu().tolist()
     for row in all_ids:
@@ -1856,6 +2389,8 @@ def sample_model_sequences(
     max_new_tokens: int = 256,
     temperature: float = 1.0,
     top_k: int = 50,
+    top_p: float = 0.0,
+    typical_p: float = 0.0,
     prompt_tokens: Optional[Sequence[str]] = None,
     device: Optional[torch.device] = None,
     diffusion_steps: Optional[int] = None,
@@ -1867,7 +2402,7 @@ def sample_model_sequences(
     ao_canvas_placeholder: str = "unk",
 ) -> List[List[str]]:
     model_type = _normalize_model_type(getattr(model.cfg, "model_type", "decoder"))
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
+    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp", "llama"):
         if model_type in ("ao_gpt", "ao_gpt_pp") and str(ao_decode_mode).strip().lower() == "ao_canvas_confidence":
             return _sample_model_sequences_ao_canvas_confidence(
                 model=model,  # type: ignore[arg-type]
@@ -1887,6 +2422,8 @@ def sample_model_sequences(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
+            typical_p=typical_p,
             prompt_tokens=prompt_tokens,
             device=device,
         )

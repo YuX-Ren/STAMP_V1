@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -170,6 +171,22 @@ class STAMPEncoder:
 
             if tok == "[END]":
                 break
+
+            if tok == ".":
+                if is_root:
+                    if strict:
+                        raise ValueError(f"Component separator without a preceding component at position {i}.")
+                    i += 1
+                    continue
+                if branch_frames:
+                    if strict:
+                        raise ValueError("Branch frames left open before component separator.")
+                    report.truncated_branches += len(branch_frames)
+                branch_frames = []
+                port_stack = []
+                is_root = True
+                i += 1
+                continue
 
             if tok == "[BACK]":
                 if strict:
@@ -364,6 +381,9 @@ class STAMPEncoder:
         while branch_frames:
             done = branch_frames.pop()
             port_stack = done.saved_stack
+
+        if rw.GetNumAtoms() == 0:
+            raise ValueError("STAMP sequence contains no molecule components.")
 
         mol = rw.GetMol()
         Chem.SanitizeMol(mol)
@@ -609,14 +629,26 @@ class STAMPEncoder:
             raise ValueError("Empty molecule is not supported.")
 
         if len(Chem.GetMolFrags(mol)) != 1:
-            raise ValueError(
-                "Disconnected molecules are not supported in one STAMP string."
-            )
+            tokens: List[str] = []
+            for comp_smi in self._canonical_component_smiles(mol):
+                comp_mol = Chem.MolFromSmiles(comp_smi)
+                if comp_mol is None or comp_mol.GetNumAtoms() == 0:
+                    raise ValueError(f"Failed to recover molecule component: {comp_smi}")
+                if tokens:
+                    tokens.append(".")
+                tokens.extend(self._encode_connected_mol(comp_mol))
+            return " ".join(tokens)
+
+        return " ".join(self._encode_connected_mol(mol))
+
+    def _encode_connected_mol(self, mol: Chem.Mol) -> List[str]:
+        if len(Chem.GetMolFrags(mol)) != 1:
+            raise ValueError("Expected a connected molecule component.")
 
         fragments, edges = self._fragments_and_edges_from_mol(mol)
         if not fragments:
             raise ValueError("Failed to build fragments.")
-        return " ".join(self._encode_graph_tokens(fragments, edges))
+        return self._encode_graph_tokens(fragments, edges)
 
     def encode_mol_to_groups(self, mol: Chem.Mol) -> List[STAMPGroup]:
         if mol.GetNumAtoms() == 0:
@@ -628,6 +660,14 @@ class STAMPEncoder:
         if not fragments:
             raise ValueError("Failed to build fragments.")
         return self._encode_graph_groups(fragments, edges)
+
+    @staticmethod
+    def _canonical_component_smiles(mol: Chem.Mol) -> List[str]:
+        smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+        components = [s for s in smiles.split(".") if s]
+        if not components:
+            raise ValueError("Failed to canonicalize molecule components.")
+        return components
 
     def _fragments_and_edges_from_mol(
         self,
@@ -663,7 +703,7 @@ class STAMPEncoder:
                 b = work_mol.GetBondWithIdx(bond_idx)
                 b.SetStereoAtoms(atoms[0], atoms[1])
                 b.SetStereo(Chem.rdchem.BondStereo(st_int))
-            groups = self.motif_tokenizer.decompose(work_mol, strict_vocab=True)
+            groups = self.motif_tokenizer.decompose(work_mol, strict_vocab=False)
             if getattr(self.motif_tokenizer, "allow_ring_single_edges", False):
                 return self._build_fragments_and_edges_from_groups(work_mol, groups)
             cut_bond_ids = self._cut_bonds_from_groups(work_mol, groups)
@@ -1088,44 +1128,29 @@ class STAMPEncoder:
         params.doIsomericSmiles = True
         params.ignoreAtomMapNumbers = True
 
+        if mol.HasProp("_smilesAtomOutputOrder"):
+            mol.ClearProp("_smilesAtomOutputOrder")
         motif = Chem.MolFragmentToSmiles(
             mol,
             params,
             atomsToUse=list(atom_indices),
         )
+        if not mol.HasProp("_smilesAtomOutputOrder"):
+            raise ValueError("RDKit failed to report canonical fragment atom order.")
 
         atom_set = set(atom_indices)
-        atom_map_numbers: Dict[int, int] = {}
-        for idx in atom_indices:
-            atom = mol.GetAtomWithIdx(idx)
-            atom_map_numbers[idx] = atom.GetAtomMapNum()
-            atom.SetAtomMapNum(idx + 1)
-
-        try:
-            mapped_smiles = Chem.MolFragmentToSmiles(
-                mol,
-                params,
-                atomsToUse=list(atom_indices),
-            )
-        finally:
-            for idx in atom_indices:
-                mol.GetAtomWithIdx(idx).SetAtomMapNum(atom_map_numbers[idx])
-
-        mapped_frag = Chem.MolFromSmiles(mapped_smiles, sanitize=False)
-        if mapped_frag is None:
-            raise ValueError("RDKit failed to parse mapped fragment SMILES.")
+        map_order = [int(x) for x in re.findall(r"\d+", mol.GetProp("_smilesAtomOutputOrder"))]
 
         orig_to_local: Dict[int, int] = {}
         heavy_count = 0
-        for atom in mapped_frag.GetAtoms():
-            map_num = atom.GetAtomMapNum()
-            if map_num <= 0:
-                continue
-            orig_idx = map_num - 1
+        for local_idx, orig_idx in enumerate(map_order):
             if orig_idx in atom_set:
-                orig_to_local[orig_idx] = atom.GetIdx()
-            if atom.GetAtomicNum() > 1:
-                heavy_count += 1
+                orig_to_local[orig_idx] = local_idx
+                if mol.GetAtomWithIdx(orig_idx).GetAtomicNum() > 1:
+                    heavy_count += 1
+
+        if len(orig_to_local) != len(atom_set):
+            raise ValueError("RDKit failed to recover canonical fragment atom order.")
 
         return motif, orig_to_local, heavy_count
 

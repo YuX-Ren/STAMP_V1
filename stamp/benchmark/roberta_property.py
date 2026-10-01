@@ -246,6 +246,19 @@ class MolRoBERTa(nn.Module):
         bsz, seqlen = input_ids.shape
         pad_mask = (input_ids == self.pad_id)  # True where padded
 
+        import os as _os
+        if _os.environ.get("STAMP_DEBUG_BOUNDS"):
+            _vmax = int(input_ids.max().item())
+            _vmin = int(input_ids.min().item())
+            _vsz = self.tok_emb.num_embeddings
+            _pmax = self.pos_emb.num_embeddings
+            assert _vmin >= 0 and _vmax < _vsz, (
+                f"BAD TOKEN ID: min={_vmin} max={_vmax} vocab_size={_vsz} shape={tuple(input_ids.shape)}"
+            )
+            assert seqlen <= _pmax, (
+                f"BAD SEQLEN: seqlen={seqlen} max_seq_len(pos_emb)={_pmax}"
+            )
+
         pos = torch.arange(seqlen, device=input_ids.device).unsqueeze(0).expand(bsz, seqlen)
         x = self.tok_emb(input_ids) + self.pos_emb(pos)
         x = self.emb_ln(x)
@@ -580,6 +593,8 @@ def pretrain_roberta(
         "mlm_head_state": head_to_save.state_dict(),
         "cfg": {k: v for k, v in vars(cfg).items()},
         "representation": representation,
+        "stamp_vocab": stamp_vocab,
+        "stamp_force_ring_aware_encode": bool(stamp_force_ring_aware_encode),
     }, out_dir / "pretrained_roberta.pt")
 
     (out_dir / "vocab.json").write_text(
@@ -613,6 +628,427 @@ def pretrain_roberta(
 
 
 # ---------------------------------------------------------------------------
+# MTR (Multi-Task Regression) pretraining: predict ~210 RDKit descriptors
+# from molecule embedding. Same encoder + tokenization as MLM; only the head
+# and the objective differ.
+# ---------------------------------------------------------------------------
+
+
+class MTRDataset(Dataset):
+    """Pairs encoded SMILES sequences with per-mol descriptor target vectors.
+
+    Targets are pre-normalized (z-score per-column using train statistics) and
+    contain NaN for entries that failed to compute. A separate mask tensor
+    (1.0 = finite, 0.0 = NaN) is returned so the loss can ignore NaN entries.
+    """
+
+    def __init__(
+        self,
+        sequences: Sequence[List[int]],
+        targets: "np.ndarray",  # (N, n_desc) float32, may contain NaN
+        max_seq_len: int = 512,
+    ) -> None:
+        assert len(sequences) == len(targets)
+        self.samples: List[Tuple[List[int], int]] = []
+        self._targets = targets
+        for i, seq in enumerate(sequences):
+            if len(seq) < 2:
+                continue
+            self.samples.append((seq[:max_seq_len], i))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], "np.ndarray"]:
+        seq, src_idx = self.samples[idx]
+        return seq, self._targets[src_idx]
+
+
+def build_mtr_collate_fn(pad_id: int):
+    def _collate(batch):
+        max_len = max(len(x) for x, _ in batch)
+        bsz = len(batch)
+        n_desc = batch[0][1].shape[0]
+        x_out = torch.full((bsz, max_len), pad_id, dtype=torch.long)
+        y_out = torch.zeros((bsz, n_desc), dtype=torch.float)
+        m_out = torch.zeros((bsz, n_desc), dtype=torch.float)
+        for i, (x, y) in enumerate(batch):
+            n = len(x)
+            x_out[i, :n] = torch.tensor(x, dtype=torch.long)
+            yt = torch.from_numpy(y).float()
+            mask = torch.isfinite(yt).float()
+            yt = torch.where(mask.bool(), yt, torch.zeros_like(yt))
+            y_out[i] = yt
+            m_out[i] = mask
+        return x_out, y_out, m_out
+    return _collate
+
+
+class MTRHead(nn.Module):
+    def __init__(self, d_model: int, n_descriptors: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.dense = nn.Linear(d_model, d_model)
+        self.proj = nn.Linear(d_model, n_descriptors)
+
+    def forward(self, cls_repr: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(cls_repr)
+        x = F.gelu(self.dense(x))
+        x = self.dropout(x)
+        return self.proj(x)
+
+
+def _load_descriptors_aligned(
+    desc_dirs,
+    smiles_list: Sequence[str],
+) -> Tuple["np.ndarray", List[str]]:
+    """Load descriptors from one or more compute_rdkit_descriptors.py outputs,
+    aligned to the given smiles_list order. Missing rows get all-NaN.
+
+    Returns (target_matrix, descriptor_names). Descriptor names come from the
+    first directory and must match across all directories.
+    """
+    import pyarrow.parquet as pq
+
+    if isinstance(desc_dirs, (str, Path)):
+        desc_dirs = [desc_dirs]
+    desc_dirs = [Path(d) for d in desc_dirs]
+
+    desc_names = json.loads((desc_dirs[0] / "desc_names.json").read_text())
+    for d in desc_dirs[1:]:
+        names_d = json.loads((d / "desc_names.json").read_text())
+        if names_d != desc_names:
+            raise ValueError(f"Descriptor name mismatch between {desc_dirs[0]} and {d}")
+    n_desc = len(desc_names)
+    n_mols = len(smiles_list)
+
+    smi2idx = {smi: i for i, smi in enumerate(smiles_list)}
+    out = np.full((n_mols, n_desc), np.nan, dtype=np.float32)
+
+    n_filled = 0
+    for desc_dir in desc_dirs:
+        shard_paths = sorted(desc_dir.glob("descriptors_shard_*.parquet"))
+        if not shard_paths:
+            raise FileNotFoundError(f"No descriptors_shard_*.parquet in {desc_dir}")
+        for sp in shard_paths:
+            tbl = pq.read_table(sp)
+            smis = tbl.column("smiles").to_pylist()
+            cols = [tbl.column(name).to_numpy(zero_copy_only=False) for name in desc_names]
+            block = np.stack(cols, axis=1).astype(np.float32, copy=False)
+            for r, s in enumerate(smis):
+                i = smi2idx.get(s)
+                if i is not None:
+                    out[i] = block[r]
+                    n_filled += 1
+    print(f"[mtr] aligned descriptors: {n_filled}/{n_mols} rows filled", flush=True)
+    return out, desc_names
+
+
+def pretrain_roberta_mtr(
+    train_smiles: Sequence[str],
+    valid_smiles: Sequence[str],
+    representation: str,
+    descriptor_dir: str | Path,
+    output_dir: str | Path,
+    cfg: Optional[RoBERTaConfig] = None,
+    show_progress: bool = True,
+    device: Optional[str] = None,
+    encode_workers: int = 1,
+    encode_chunksize: int = 128,
+    stamp_vocab: Optional[str] = None,
+    stamp_force_ring_aware_encode: bool = False,
+) -> Dict[str, Any]:
+    """Pre-train a RoBERTa encoder by regressing on RDKit descriptors (MTR).
+
+    descriptor_dir must contain the output of compute_rdkit_descriptors.py:
+        - descriptors_shard_*.parquet (smiles + 210 descriptor columns)
+        - desc_names.json
+        - desc_stats.json (mean/std per descriptor)
+    """
+    rep = build_representation(
+        representation,
+        stamp_vocab=stamp_vocab,
+        stamp_force_ring_aware_encode=stamp_force_ring_aware_encode,
+    )
+    if isinstance(rep, UnsupportedRepresentation):
+        raise RepresentationError(
+            f"Cannot pretrain-mtr for unsupported representation: {representation}"
+        )
+
+    cfg = cfg or RoBERTaConfig()
+    _set_seed(cfg.seed)
+    dev = _resolve_torch_device(device)
+
+    # Single-pass parallel encoder that preserves alignment between input
+    # SMILES and output tokens (returns parallel lists; drops failures).
+    def _encode_aligned(smis_in: Sequence[str], desc_label: str):
+        from concurrent.futures import ProcessPoolExecutor
+        from .lm import _init_encode_worker, _encode_one_smiles_worker
+        kept_smis: List[str] = []
+        kept_toks: List[List[str]] = []
+        if encode_workers <= 1:
+            for s in smis_in:
+                try:
+                    text = rep.encode(s)
+                    toks = rep.tokenize(text)
+                    if toks:
+                        kept_smis.append(s)
+                        kept_toks.append(toks)
+                except Exception:
+                    pass
+            return kept_smis, kept_toks
+        with ProcessPoolExecutor(
+            max_workers=encode_workers,
+            initializer=_init_encode_worker,
+            initargs=(
+                rep.name,
+                getattr(rep, "_vocab_path", None),
+                getattr(rep, "_force_ring_aware_encode", False),
+            ),
+        ) as pool:
+            mapped = pool.map(_encode_one_smiles_worker, smis_in, chunksize=encode_chunksize)
+            for s, toks in zip(smis_in, mapped):
+                if toks:
+                    kept_smis.append(s)
+                    kept_toks.append(toks)
+        print(f"[mtr] {desc_label}: {len(kept_smis)}/{len(smis_in)} encoded", flush=True)
+        return kept_smis, kept_toks
+
+    print(f"[mtr] representation={representation}", flush=True)
+    print(f"[mtr] encoding train set...", flush=True)
+    train_smis_aligned, train_tok = _encode_aligned(train_smiles, "train")
+    print(f"[mtr] encoding valid set...", flush=True)
+    valid_smis_aligned, valid_tok = _encode_aligned(valid_smiles, "valid")
+    if not train_tok:
+        raise ValueError("No train samples encoded.")
+
+    vocab = build_roberta_vocab(train_tok, min_freq=1)
+    train_ids = [[vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id] for toks in train_tok]
+    valid_ids = [[vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id] for toks in valid_tok]
+
+    print("[mtr] loading descriptor targets...", flush=True)
+    desc_dirs = descriptor_dir if isinstance(descriptor_dir, (list, tuple)) else [descriptor_dir]
+    train_targets, desc_names = _load_descriptors_aligned(desc_dirs, train_smis_aligned)
+    valid_targets, _ = _load_descriptors_aligned(desc_dirs, valid_smis_aligned)
+    n_desc = len(desc_names)
+
+    # Stats are taken from the first (typically training-corpus) descriptor dir.
+    desc_stats = json.loads((Path(desc_dirs[0]) / "desc_stats.json").read_text())
+    desc_mean = np.asarray(desc_stats["mean"], dtype=np.float64)
+    desc_std = np.asarray(desc_stats["std"], dtype=np.float64)
+
+    # Filter pathological descriptors. Some RDKit descriptors (Ipc, Kappa3) can
+    # produce values up to 1e30+ for large molecules, breaking float32 stats.
+    # We drop descriptors whose mean/std overflow or whose std exceeds 1e6.
+    keep = np.isfinite(desc_mean) & np.isfinite(desc_std) & (desc_std < 1e6) & (desc_std > 1e-6)
+    n_dropped = int((~keep).sum())
+    if n_dropped > 0:
+        dropped_names = [desc_names[i] for i in np.where(~keep)[0]]
+        print(f"[mtr] dropping {n_dropped} pathological descriptors: {dropped_names}", flush=True)
+    desc_names = [desc_names[i] for i in np.where(keep)[0]]
+    desc_mean = desc_mean[keep].astype(np.float32)
+    desc_std = desc_std[keep].astype(np.float32)
+    train_targets = train_targets[:, keep]
+    valid_targets = valid_targets[:, keep]
+    n_desc = len(desc_names)
+
+    # z-score per descriptor; clip outliers so loss isn't tail-dominated.
+    train_targets = (train_targets - desc_mean) / desc_std
+    valid_targets = (valid_targets - desc_mean) / desc_std
+    train_targets = np.clip(train_targets, -10.0, 10.0)
+    valid_targets = np.clip(valid_targets, -10.0, 10.0)
+
+    print(f"[mtr] n_desc={n_desc}, train={len(train_ids)}, valid={len(valid_ids)}", flush=True)
+
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(cfg.tf32)
+        torch.backends.cudnn.allow_tf32 = bool(cfg.tf32)
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    use_amp, amp_dtype, use_scaler, amp_label = _resolve_amp_mode(cfg.amp, dev)
+
+    ds_train = MTRDataset(train_ids, train_targets, max_seq_len=cfg.max_seq_len)
+    ds_valid = MTRDataset(valid_ids, valid_targets, max_seq_len=cfg.max_seq_len)
+    collate_fn = build_mtr_collate_fn(vocab.pad_id)
+    pin = dev.type == "cuda"
+    dl_kwargs: Dict[str, Any] = {
+        "batch_size": cfg.batch_size,
+        "shuffle": True,
+        "drop_last": True,
+        "collate_fn": collate_fn,
+        "pin_memory": pin,
+        "num_workers": max(0, cfg.num_data_workers),
+    }
+    if cfg.num_data_workers > 0:
+        dl_kwargs["prefetch_factor"] = max(2, cfg.prefetch_factor)
+        dl_kwargs["persistent_workers"] = True
+    loader_train = DataLoader(ds_train, **dl_kwargs)
+    dl_valid_kwargs = dict(dl_kwargs)
+    dl_valid_kwargs["shuffle"] = False
+    loader_valid = DataLoader(ds_valid, **dl_valid_kwargs)
+
+    encoder = MolRoBERTa(vocab_size=len(vocab.itos), cfg=cfg, pad_id=vocab.pad_id)
+    head = MTRHead(cfg.d_model, n_desc, dropout=cfg.dropout)
+
+    if cfg.torch_compile and hasattr(torch, "compile"):
+        try:
+            encoder = torch.compile(encoder)
+            head = torch.compile(head)
+            print("[mtr] torch.compile enabled", flush=True)
+        except Exception as exc:
+            print(f"[mtr] torch.compile fallback: {exc}", flush=True)
+
+    encoder.to(dev)
+    head.to(dev)
+    n_params = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in head.parameters())
+    print(f"[mtr] device={dev}, params={n_params} (~{n_params/1e6:.2f}M)", flush=True)
+    print(f"[mtr] amp={amp_label}, vocab_size={len(vocab.itos)}", flush=True)
+
+    all_params = list(encoder.parameters()) + list(head.parameters())
+    adamw_kwargs: Dict[str, Any] = {"lr": cfg.lr, "weight_decay": cfg.weight_decay}
+    if dev.type == "cuda":
+        adamw_kwargs["fused"] = True
+    try:
+        optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
+    except TypeError:
+        adamw_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    non_blocking = dev.type == "cuda"
+
+    total_steps = len(loader_train) * cfg.pretrain_epochs
+    warmup_steps = max(1, total_steps // 10)
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    history: List[Dict[str, Any]] = []
+    best_valid = float("inf")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, cfg.pretrain_epochs + 1):
+        encoder.train(); head.train()
+        train_losses = []
+        train_iter = iterable_with_progress(
+            loader_train, show_progress=show_progress,
+            total=len(loader_train),
+            desc=f"PretrainMTR[{representation}] ep{epoch}/{cfg.pretrain_epochs}",
+        )
+        for x, y, m in train_iter:
+            x = x.to(dev, non_blocking=non_blocking)
+            y = y.to(dev, non_blocking=non_blocking)
+            m = m.to(dev, non_blocking=non_blocking)
+            optimizer.zero_grad(set_to_none=True)
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+                if use_amp else nullcontext()
+            )
+            with amp_ctx:
+                cls_repr = encoder(x, return_cls=True)
+                preds = head(cls_repr)
+                # Masked MSE: ignore NaN entries
+                diff2 = (preds - y) ** 2
+                denom = m.sum().clamp_min(1.0)
+                loss = (diff2 * m).sum() / denom
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                scaler.step(optimizer); scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                optimizer.step()
+            scheduler.step()
+            train_losses.append(float(loss.item()))
+
+        encoder.eval(); head.eval()
+        valid_losses = []
+        with torch.no_grad():
+            for x, y, m in loader_valid:
+                x = x.to(dev, non_blocking=non_blocking)
+                y = y.to(dev, non_blocking=non_blocking)
+                m = m.to(dev, non_blocking=non_blocking)
+                amp_ctx = (
+                    torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+                    if use_amp else nullcontext()
+                )
+                with amp_ctx:
+                    cls_repr = encoder(x, return_cls=True)
+                    preds = head(cls_repr)
+                    diff2 = (preds - y) ** 2
+                    denom = m.sum().clamp_min(1.0)
+                    loss = (diff2 * m).sum() / denom
+                valid_losses.append(float(loss.item()))
+
+        t_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        v_loss = float(np.mean(valid_losses)) if valid_losses else float("nan")
+        history.append({"epoch": epoch, "train_mse": t_loss, "valid_mse": v_loss})
+        print(
+            f"[mtr] epoch {epoch}/{cfg.pretrain_epochs}  train_mse={t_loss:.4f}  valid_mse={v_loss:.4f}",
+            flush=True,
+        )
+        if v_loss < best_valid:
+            best_valid = v_loss
+            enc_to_save = encoder._orig_mod if hasattr(encoder, "_orig_mod") else encoder
+            head_to_save = head._orig_mod if hasattr(head, "_orig_mod") else head
+            torch.save({
+                "encoder_state": enc_to_save.state_dict(),
+                "mtr_head_state": head_to_save.state_dict(),
+                "cfg": {k: v for k, v in vars(cfg).items()},
+                "representation": representation,
+                "stamp_vocab": stamp_vocab,
+                "stamp_force_ring_aware_encode": bool(stamp_force_ring_aware_encode),
+                "objective": "mtr",
+                "n_descriptors": n_desc,
+                "descriptor_names": desc_names,
+                "descriptor_mean": desc_mean.tolist(),
+                "descriptor_std": desc_std.tolist(),
+            }, out_dir / "pretrained_roberta.pt")
+
+    (out_dir / "vocab.json").write_text(
+        json.dumps(vocab.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "pretrain_history.json").write_text(
+        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "pretrain_meta.json").write_text(
+        json.dumps({
+            "objective": "mtr",
+            "representation": representation,
+            "n_train": len(train_ids),
+            "n_valid": len(valid_ids),
+            "vocab_size": len(vocab.itos),
+            "n_descriptors": n_desc,
+            "n_params": n_params,
+            "best_valid_mse": best_valid,
+            "cfg": {k: v for k, v in vars(cfg).items()},
+            "device": str(dev),
+        }, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    return {
+        "output_dir": str(out_dir),
+        "history": history,
+        "best_valid_mse": best_valid,
+        "vocab_size": len(vocab.itos),
+        "n_params": n_params,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Load pre-trained model
 # ---------------------------------------------------------------------------
 
@@ -636,7 +1072,11 @@ def load_pretrained_roberta(
     model.to(dev)
     model.eval()
 
-    rep = build_representation(rep_name)
+    rep = build_representation(
+        rep_name,
+        stamp_vocab=ckpt.get("stamp_vocab"),
+        stamp_force_ring_aware_encode=ckpt.get("stamp_force_ring_aware_encode", False),
+    )
     return model, vocab, rep, cfg, dev
 
 
@@ -724,6 +1164,20 @@ _MOLECULENET_TASKS: Dict[str, Dict[str, Any]] = {
         "task_type": "regression",
         "metric": "rmse",
     },
+    "bace_regression": {
+        "dataset_name": "BACE_regression",
+        "target_column": "pIC50",
+        "smiles_column": "mol",
+        "task_type": "regression",
+        "metric": "rmse",
+    },
+    "clearance": {
+        "dataset_name": "Clearance",
+        "target_column": "exp",
+        "smiles_column": "smiles",
+        "task_type": "regression",
+        "metric": "rmse",
+    },
 }
 
 
@@ -772,21 +1226,29 @@ def _load_via_deepchem(
         "esol": dc.molnet.load_delaney,
         "freesolv": dc.molnet.load_sampl,
         "lipophilicity": dc.molnet.load_lipo,
+        "bace_regression": dc.molnet.load_bace_regression,
+        "clearance": dc.molnet.load_clearance,
     }
     loader = loaders[task_key]
 
-    # scaffold split is standard for MoleculeNet; fallback to random
+    # scaffold split is standard for MoleculeNet; fallback to random.
+    # Pass transformers=[] to disable deepchem's default NormalizationTransformer
+    # for regression tasks — we want RAW labels here so our finetune-side
+    # z-score is the *only* normalization, and reported RMSE is in raw chemical
+    # units (matching how MoleculeNet results are conventionally reported).
     try:
         tasks_list, datasets, transformers = loader(
             featurizer=dc.feat.DummyFeaturizer(),
             splitter="scaffold",
             data_dir=data_root,
+            transformers=[],
         )
     except Exception:
         tasks_list, datasets, transformers = loader(
             featurizer=dc.feat.DummyFeaturizer(),
             splitter="random",
             data_dir=data_root,
+            transformers=[],
         )
 
     train_ds, valid_ds, test_ds = datasets
@@ -1003,7 +1465,14 @@ def finetune_roberta(
 ) -> Dict[str, Any]:
     """Fine-tune a pre-trained RoBERTa encoder on a MoleculeNet task (classification or regression)."""
     encoder, vocab, rep, pretrained_cfg, dev = load_pretrained_roberta(pretrained_dir, device=device)
-    cfg = cfg or pretrained_cfg
+    if cfg is None:
+        cfg = pretrained_cfg
+    else:
+        # Architectural params must match the loaded encoder; finetune cfg only
+        # carries optimization knobs (lr/bs/epochs/dropout/amp/...). Override
+        # them from pretrained_cfg so e.g. max_seq_len matches pos_emb size.
+        for _arch in ("d_model", "n_heads", "n_layers", "d_ff", "max_seq_len"):
+            setattr(cfg, _arch, getattr(pretrained_cfg, _arch))
 
     _set_seed(cfg.seed)
 

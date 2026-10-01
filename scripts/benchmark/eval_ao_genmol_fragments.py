@@ -265,7 +265,9 @@ def main() -> int:
     p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--seed-base", type=int, default=0, help="Random seed for sampling.")
     args = p.parse_args()
+    import torch as _torch
 
     RDLogger.DisableLog("rdApp.*")
     out_dir = Path(args.output_dir)
@@ -275,10 +277,12 @@ def main() -> int:
     if getattr(rep, "name", "") != "stamp":
         raise ValueError("This benchmark script currently expects a STAMP model.")
 
+    _torch.manual_seed(int(args.seed_base))
+    _torch.cuda.manual_seed_all(int(args.seed_base))
     df = pd.read_csv(args.fragments_csv)
     sa = _load_sa_scorer()
     tasks = ["linker_design", "motif_extension", "scaffold_decoration", "superstructure_generation"]
-    all_results: Dict[str, Any] = {"model_dir": str(args.model_dir), "fragments_csv": str(args.fragments_csv), "num_samples": int(args.num_samples), "temperature": float(args.temperature), "top_k": int(args.top_k), "tasks": {}}
+    all_results: Dict[str, Any] = {"model_dir": str(args.model_dir), "fragments_csv": str(args.fragments_csv), "num_samples": int(args.num_samples), "temperature": float(args.temperature), "top_k": int(args.top_k), "seed": int(args.seed_base), "tasks": {}}
 
     for task in tasks:
         validity: list[float] = []
@@ -387,7 +391,8 @@ def main() -> int:
         }
         all_results["tasks"][task] = summary
 
-    (out_dir / "genmol_fragment_benchmark.json").write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_name = f"genmol_fragment_benchmark_seed{int(args.seed_base)}.json"
+    (out_dir / out_name).write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({k: {m: v for m, v in task_res.items() if m in ['validity','uniqueness','quality','diversity','distance']} for k, task_res in all_results['tasks'].items()}, ensure_ascii=False, indent=2))
     return 0
 
