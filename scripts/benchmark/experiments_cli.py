@@ -651,19 +651,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_pt.add_argument("--encode-chunksize", type=int, default=128)
     p_pt.add_argument("--no-tqdm", action="store_true")
 
+    p_mtr = sp.add_parser(
+        "pretrain-roberta-mtr",
+        help="Pretrain a RoBERTa encoder via Multi-Task Regression on RDKit descriptors (ChemBERTa-2 MTR variant).",
+    )
+    p_mtr.add_argument("--train", required=True)
+    p_mtr.add_argument("--valid", required=True)
+    p_mtr.add_argument("--representation", required=True)
+    p_mtr.add_argument("--descriptor-dir", required=True, action="append",
+                       help="Output of compute_rdkit_descriptors.py. Pass multiple times to combine shards (e.g. one for train, one for valid).")
+    p_mtr.add_argument("--output-dir", required=True)
+    p_mtr.add_argument("--d-model", type=int, default=768)
+    p_mtr.add_argument("--n-heads", type=int, default=12)
+    p_mtr.add_argument("--n-layers", type=int, default=6)
+    p_mtr.add_argument("--d-ff", type=int, default=1536)
+    p_mtr.add_argument("--dropout", type=float, default=0.1)
+    p_mtr.add_argument("--max-seq-len", type=int, default=128)
+    p_mtr.add_argument("--stamp-force-ring-aware-encode", action="store_true")
+    p_mtr.add_argument("--stamp-vocab", default=None)
+    p_mtr.add_argument("--batch-size", type=int, default=512)
+    p_mtr.add_argument("--lr", type=float, default=3e-4)
+    p_mtr.add_argument("--weight-decay", type=float, default=0.01)
+    p_mtr.add_argument("--pretrain-epochs", type=int, default=5)
+    p_mtr.add_argument("--seed", type=int, default=42)
+    p_mtr.add_argument("--num-data-workers", type=int, default=0)
+    p_mtr.add_argument("--prefetch-factor", type=int, default=2)
+    p_mtr.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "none"])
+    p_mtr.add_argument("--torch-compile", action="store_true")
+    p_mtr.add_argument("--no-tf32", action="store_true")
+    p_mtr.add_argument("--device", default="cuda")
+    p_mtr.add_argument("--encode-workers", type=int, default=1)
+    p_mtr.add_argument("--encode-chunksize", type=int, default=128)
+    p_mtr.add_argument("--no-tqdm", action="store_true")
+
     p_ft = sp.add_parser(
         "finetune-roberta",
         help="Fine-tune a pre-trained RoBERTa on a MoleculeNet task (Experiment G step 2).",
     )
     p_ft.add_argument("--pretrained-dir", required=True, help="Directory with pretrained_roberta.pt.")
-    p_ft.add_argument("--task", required=True, choices=["bbbp", "hiv", "tox21", "bace", "clintox", "sider", "muv", "esol", "freesolv", "lipophilicity"], help="MoleculeNet task name.")
+    p_ft.add_argument("--task", required=True, choices=["bbbp", "hiv", "tox21", "bace", "clintox", "sider", "muv", "esol", "freesolv", "lipophilicity", "bace_regression", "clearance"], help="MoleculeNet task name.")
     p_ft.add_argument("--output-dir", required=True)
     p_ft.add_argument("--data-dir", default=None, help="Directory for MoleculeNet data (DeepChem or local CSV).")
     p_ft.add_argument("--split-seed", type=int, default=42)
+    p_ft.add_argument("--train-seed", type=int, default=42, help="Torch RNG seed for finetune (model init/dropout/data shuffle).")
     p_ft.add_argument("--finetune-epochs", type=int, default=20)
     p_ft.add_argument("--finetune-lr", type=float, default=2e-5)
     p_ft.add_argument("--finetune-batch-size", type=int, default=32)
     p_ft.add_argument("--dropout", type=float, default=0.1)
+    p_ft.add_argument("--weight-decay", type=float, default=0.01)
+    p_ft.add_argument(
+        "--multitask-classification",
+        action="store_true",
+        help="For multi-endpoint classification datasets such as Tox21, train one masked multi-task head and report mean ROC-AUC.",
+    )
     p_ft.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "none"])
     p_ft.add_argument("--no-tf32", action="store_true")
     p_ft.add_argument("--device", default="cuda")
@@ -1342,12 +1382,53 @@ def main() -> int:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
 
+    if args.cmd == "pretrain-roberta-mtr":
+        from stamp.benchmark.roberta_property import pretrain_roberta_mtr
+        train = _load_smiles_txt(args.train)
+        valid = _load_smiles_txt(args.valid)
+        cfg = RoBERTaConfig(
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            d_ff=args.d_ff,
+            dropout=args.dropout,
+            max_seq_len=args.max_seq_len,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            pretrain_epochs=args.pretrain_epochs,
+            seed=args.seed,
+            num_data_workers=args.num_data_workers,
+            prefetch_factor=args.prefetch_factor,
+            amp=args.amp,
+            torch_compile=bool(args.torch_compile),
+            tf32=not bool(args.no_tf32),
+        )
+        res = pretrain_roberta_mtr(
+            train_smiles=train,
+            valid_smiles=valid,
+            representation=args.representation,
+            descriptor_dir=args.descriptor_dir,
+            output_dir=args.output_dir,
+            cfg=cfg,
+            show_progress=not args.no_tqdm,
+            device=args.device,
+            encode_workers=args.encode_workers,
+            encode_chunksize=args.encode_chunksize,
+            stamp_vocab=getattr(args, "stamp_vocab", None),
+            stamp_force_ring_aware_encode=bool(getattr(args, "stamp_force_ring_aware_encode", False)),
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+
     if args.cmd == "finetune-roberta":
         cfg = RoBERTaConfig(
+            seed=args.train_seed,
             finetune_epochs=args.finetune_epochs,
             finetune_lr=args.finetune_lr,
             finetune_batch_size=args.finetune_batch_size,
             dropout=args.dropout,
+            weight_decay=args.weight_decay,
             amp=args.amp,
             tf32=not bool(args.no_tf32),
             num_data_workers=args.num_data_workers,
@@ -1364,6 +1445,7 @@ def main() -> int:
             device=args.device,
             encode_workers=args.encode_workers,
             encode_chunksize=args.encode_chunksize,
+            multitask_classification=bool(args.multitask_classification),
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0

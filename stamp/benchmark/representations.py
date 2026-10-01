@@ -68,9 +68,11 @@ class STAMPRepresentation(BaseRepresentation):
         self,
         vocab_path: str | None = None,
         force_ring_aware_encode: bool = False,
+        strict_vocab: bool = True,
     ) -> None:
         self._vocab_path = vocab_path
         self._force_ring_aware_encode = bool(force_ring_aware_encode)
+        self._strict_vocab = bool(strict_vocab)
         tokenizer = None
         if vocab_path is not None:
             from ..vocab.principal_subgraph import PrincipalSubgraphTokenizer
@@ -82,7 +84,7 @@ class STAMPRepresentation(BaseRepresentation):
                 # fragments, so unseen scaffolds don't become a single OOV group.
                 tokenizer.allow_ring_single_edges = True
                 tokenizer.blessed_rings = set(tokenizer.vocab.keys())
-        self.codec = STAMPEncoder(motif_tokenizer=tokenizer)
+        self.codec = STAMPEncoder(motif_tokenizer=tokenizer, strict_vocab=self._strict_vocab)
 
     def encode(self, smiles: str) -> str:
         return self.codec.encode_smiles(smiles)

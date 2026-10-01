@@ -130,11 +130,13 @@ class STAMPEncoder:
         min_branch_n: int = 1,
         max_branch_n: Optional[int] = None,
         motif_tokenizer: Optional["PrincipalSubgraphTokenizer"] = None,
+        strict_vocab: bool = True,
     ) -> None:
         self.cut_rule = cut_rule
         self.min_branch_n = min_branch_n
         self.max_branch_n = max_branch_n
         self.motif_tokenizer = motif_tokenizer
+        self.strict_vocab = bool(strict_vocab)
 
     def encode_smiles(self, smiles: str) -> str:
         mol = Chem.MolFromSmiles(smiles)
@@ -663,7 +665,7 @@ class STAMPEncoder:
                 b = work_mol.GetBondWithIdx(bond_idx)
                 b.SetStereoAtoms(atoms[0], atoms[1])
                 b.SetStereo(Chem.rdchem.BondStereo(st_int))
-            groups = self.motif_tokenizer.decompose(work_mol, strict_vocab=True)
+            groups = self.motif_tokenizer.decompose(work_mol, strict_vocab=self.strict_vocab)
             if getattr(self.motif_tokenizer, "allow_ring_single_edges", False):
                 return self._build_fragments_and_edges_from_groups(work_mol, groups)
             cut_bond_ids = self._cut_bonds_from_groups(work_mol, groups)

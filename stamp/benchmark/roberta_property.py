@@ -209,6 +209,48 @@ def build_cls_collate_fn(pad_id: int):
     return _collate
 
 
+class MultitaskClassificationDataset(Dataset):
+    def __init__(
+        self,
+        sequences: Sequence[List[int]],
+        labels: Sequence[Sequence[float]],
+        masks: Sequence[Sequence[float]],
+        max_seq_len: int = 512,
+        pad_id: int = 0,
+    ) -> None:
+        self.samples: List[Tuple[List[int], List[float], List[float]]] = []
+        for seq, label, mask in zip(sequences, labels, masks):
+            if len(seq) < 2:
+                continue
+            if sum(float(m) for m in mask) <= 0:
+                continue
+            self.samples.append((seq[:max_seq_len], [float(x) for x in label], [float(x) for x in mask]))
+        self.pad_id = pad_id
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], List[float], List[float]]:
+        return self.samples[idx]
+
+
+def build_multitask_cls_collate_fn(pad_id: int):
+    def _collate(batch: Sequence[Tuple[List[int], List[float], List[float]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        max_len = max(len(x) for x, _, _ in batch)
+        bsz = len(batch)
+        n_tasks = len(batch[0][1])
+        x_out = torch.full((bsz, max_len), pad_id, dtype=torch.long)
+        y_out = torch.zeros((bsz, n_tasks), dtype=torch.float)
+        m_out = torch.zeros((bsz, n_tasks), dtype=torch.float)
+        for i, (x, y, m) in enumerate(batch):
+            n = len(x)
+            x_out[i, :n] = torch.tensor(x, dtype=torch.long)
+            y_out[i] = torch.tensor(y, dtype=torch.float)
+            m_out[i] = torch.tensor(m, dtype=torch.float)
+        return x_out, y_out, m_out
+    return _collate
+
+
 # ---------------------------------------------------------------------------
 # RoBERTa model
 # ---------------------------------------------------------------------------
@@ -245,6 +287,19 @@ class MolRoBERTa(nn.Module):
     ) -> torch.Tensor:
         bsz, seqlen = input_ids.shape
         pad_mask = (input_ids == self.pad_id)  # True where padded
+
+        import os as _os
+        if _os.environ.get("STAMP_DEBUG_BOUNDS"):
+            _vmax = int(input_ids.max().item())
+            _vmin = int(input_ids.min().item())
+            _vsz = self.tok_emb.num_embeddings
+            _pmax = self.pos_emb.num_embeddings
+            assert _vmin >= 0 and _vmax < _vsz, (
+                f"BAD TOKEN ID: min={_vmin} max={_vmax} vocab_size={_vsz} shape={tuple(input_ids.shape)}"
+            )
+            assert seqlen <= _pmax, (
+                f"BAD SEQLEN: seqlen={seqlen} max_seq_len(pos_emb)={_pmax}"
+            )
 
         pos = torch.arange(seqlen, device=input_ids.device).unsqueeze(0).expand(bsz, seqlen)
         x = self.tok_emb(input_ids) + self.pos_emb(pos)
@@ -580,6 +635,8 @@ def pretrain_roberta(
         "mlm_head_state": head_to_save.state_dict(),
         "cfg": {k: v for k, v in vars(cfg).items()},
         "representation": representation,
+        "stamp_vocab": stamp_vocab,
+        "stamp_force_ring_aware_encode": bool(stamp_force_ring_aware_encode),
     }, out_dir / "pretrained_roberta.pt")
 
     (out_dir / "vocab.json").write_text(
@@ -613,6 +670,427 @@ def pretrain_roberta(
 
 
 # ---------------------------------------------------------------------------
+# MTR (Multi-Task Regression) pretraining: predict ~210 RDKit descriptors
+# from molecule embedding. Same encoder + tokenization as MLM; only the head
+# and the objective differ.
+# ---------------------------------------------------------------------------
+
+
+class MTRDataset(Dataset):
+    """Pairs encoded SMILES sequences with per-mol descriptor target vectors.
+
+    Targets are pre-normalized (z-score per-column using train statistics) and
+    contain NaN for entries that failed to compute. A separate mask tensor
+    (1.0 = finite, 0.0 = NaN) is returned so the loss can ignore NaN entries.
+    """
+
+    def __init__(
+        self,
+        sequences: Sequence[List[int]],
+        targets: "np.ndarray",  # (N, n_desc) float32, may contain NaN
+        max_seq_len: int = 512,
+    ) -> None:
+        assert len(sequences) == len(targets)
+        self.samples: List[Tuple[List[int], int]] = []
+        self._targets = targets
+        for i, seq in enumerate(sequences):
+            if len(seq) < 2:
+                continue
+            self.samples.append((seq[:max_seq_len], i))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[List[int], "np.ndarray"]:
+        seq, src_idx = self.samples[idx]
+        return seq, self._targets[src_idx]
+
+
+def build_mtr_collate_fn(pad_id: int):
+    def _collate(batch):
+        max_len = max(len(x) for x, _ in batch)
+        bsz = len(batch)
+        n_desc = batch[0][1].shape[0]
+        x_out = torch.full((bsz, max_len), pad_id, dtype=torch.long)
+        y_out = torch.zeros((bsz, n_desc), dtype=torch.float)
+        m_out = torch.zeros((bsz, n_desc), dtype=torch.float)
+        for i, (x, y) in enumerate(batch):
+            n = len(x)
+            x_out[i, :n] = torch.tensor(x, dtype=torch.long)
+            yt = torch.from_numpy(y).float()
+            mask = torch.isfinite(yt).float()
+            yt = torch.where(mask.bool(), yt, torch.zeros_like(yt))
+            y_out[i] = yt
+            m_out[i] = mask
+        return x_out, y_out, m_out
+    return _collate
+
+
+class MTRHead(nn.Module):
+    def __init__(self, d_model: int, n_descriptors: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.dense = nn.Linear(d_model, d_model)
+        self.proj = nn.Linear(d_model, n_descriptors)
+
+    def forward(self, cls_repr: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(cls_repr)
+        x = F.gelu(self.dense(x))
+        x = self.dropout(x)
+        return self.proj(x)
+
+
+def _load_descriptors_aligned(
+    desc_dirs,
+    smiles_list: Sequence[str],
+) -> Tuple["np.ndarray", List[str]]:
+    """Load descriptors from one or more compute_rdkit_descriptors.py outputs,
+    aligned to the given smiles_list order. Missing rows get all-NaN.
+
+    Returns (target_matrix, descriptor_names). Descriptor names come from the
+    first directory and must match across all directories.
+    """
+    import pyarrow.parquet as pq
+
+    if isinstance(desc_dirs, (str, Path)):
+        desc_dirs = [desc_dirs]
+    desc_dirs = [Path(d) for d in desc_dirs]
+
+    desc_names = json.loads((desc_dirs[0] / "desc_names.json").read_text())
+    for d in desc_dirs[1:]:
+        names_d = json.loads((d / "desc_names.json").read_text())
+        if names_d != desc_names:
+            raise ValueError(f"Descriptor name mismatch between {desc_dirs[0]} and {d}")
+    n_desc = len(desc_names)
+    n_mols = len(smiles_list)
+
+    smi2idx = {smi: i for i, smi in enumerate(smiles_list)}
+    out = np.full((n_mols, n_desc), np.nan, dtype=np.float32)
+
+    n_filled = 0
+    for desc_dir in desc_dirs:
+        shard_paths = sorted(desc_dir.glob("descriptors_shard_*.parquet"))
+        if not shard_paths:
+            raise FileNotFoundError(f"No descriptors_shard_*.parquet in {desc_dir}")
+        for sp in shard_paths:
+            tbl = pq.read_table(sp)
+            smis = tbl.column("smiles").to_pylist()
+            cols = [tbl.column(name).to_numpy(zero_copy_only=False) for name in desc_names]
+            block = np.stack(cols, axis=1).astype(np.float32, copy=False)
+            for r, s in enumerate(smis):
+                i = smi2idx.get(s)
+                if i is not None:
+                    out[i] = block[r]
+                    n_filled += 1
+    print(f"[mtr] aligned descriptors: {n_filled}/{n_mols} rows filled", flush=True)
+    return out, desc_names
+
+
+def pretrain_roberta_mtr(
+    train_smiles: Sequence[str],
+    valid_smiles: Sequence[str],
+    representation: str,
+    descriptor_dir: str | Path,
+    output_dir: str | Path,
+    cfg: Optional[RoBERTaConfig] = None,
+    show_progress: bool = True,
+    device: Optional[str] = None,
+    encode_workers: int = 1,
+    encode_chunksize: int = 128,
+    stamp_vocab: Optional[str] = None,
+    stamp_force_ring_aware_encode: bool = False,
+) -> Dict[str, Any]:
+    """Pre-train a RoBERTa encoder by regressing on RDKit descriptors (MTR).
+
+    descriptor_dir must contain the output of compute_rdkit_descriptors.py:
+        - descriptors_shard_*.parquet (smiles + 210 descriptor columns)
+        - desc_names.json
+        - desc_stats.json (mean/std per descriptor)
+    """
+    rep = build_representation(
+        representation,
+        stamp_vocab=stamp_vocab,
+        stamp_force_ring_aware_encode=stamp_force_ring_aware_encode,
+    )
+    if isinstance(rep, UnsupportedRepresentation):
+        raise RepresentationError(
+            f"Cannot pretrain-mtr for unsupported representation: {representation}"
+        )
+
+    cfg = cfg or RoBERTaConfig()
+    _set_seed(cfg.seed)
+    dev = _resolve_torch_device(device)
+
+    # Single-pass parallel encoder that preserves alignment between input
+    # SMILES and output tokens (returns parallel lists; drops failures).
+    def _encode_aligned(smis_in: Sequence[str], desc_label: str):
+        from concurrent.futures import ProcessPoolExecutor
+        from .lm import _init_encode_worker, _encode_one_smiles_worker
+        kept_smis: List[str] = []
+        kept_toks: List[List[str]] = []
+        if encode_workers <= 1:
+            for s in smis_in:
+                try:
+                    text = rep.encode(s)
+                    toks = rep.tokenize(text)
+                    if toks:
+                        kept_smis.append(s)
+                        kept_toks.append(toks)
+                except Exception:
+                    pass
+            return kept_smis, kept_toks
+        with ProcessPoolExecutor(
+            max_workers=encode_workers,
+            initializer=_init_encode_worker,
+            initargs=(
+                rep.name,
+                getattr(rep, "_vocab_path", None),
+                getattr(rep, "_force_ring_aware_encode", False),
+            ),
+        ) as pool:
+            mapped = pool.map(_encode_one_smiles_worker, smis_in, chunksize=encode_chunksize)
+            for s, toks in zip(smis_in, mapped):
+                if toks:
+                    kept_smis.append(s)
+                    kept_toks.append(toks)
+        print(f"[mtr] {desc_label}: {len(kept_smis)}/{len(smis_in)} encoded", flush=True)
+        return kept_smis, kept_toks
+
+    print(f"[mtr] representation={representation}", flush=True)
+    print(f"[mtr] encoding train set...", flush=True)
+    train_smis_aligned, train_tok = _encode_aligned(train_smiles, "train")
+    print(f"[mtr] encoding valid set...", flush=True)
+    valid_smis_aligned, valid_tok = _encode_aligned(valid_smiles, "valid")
+    if not train_tok:
+        raise ValueError("No train samples encoded.")
+
+    vocab = build_roberta_vocab(train_tok, min_freq=1)
+    train_ids = [[vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id] for toks in train_tok]
+    valid_ids = [[vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id] for toks in valid_tok]
+
+    print("[mtr] loading descriptor targets...", flush=True)
+    desc_dirs = descriptor_dir if isinstance(descriptor_dir, (list, tuple)) else [descriptor_dir]
+    train_targets, desc_names = _load_descriptors_aligned(desc_dirs, train_smis_aligned)
+    valid_targets, _ = _load_descriptors_aligned(desc_dirs, valid_smis_aligned)
+    n_desc = len(desc_names)
+
+    # Stats are taken from the first (typically training-corpus) descriptor dir.
+    desc_stats = json.loads((Path(desc_dirs[0]) / "desc_stats.json").read_text())
+    desc_mean = np.asarray(desc_stats["mean"], dtype=np.float64)
+    desc_std = np.asarray(desc_stats["std"], dtype=np.float64)
+
+    # Filter pathological descriptors. Some RDKit descriptors (Ipc, Kappa3) can
+    # produce values up to 1e30+ for large molecules, breaking float32 stats.
+    # We drop descriptors whose mean/std overflow or whose std exceeds 1e6.
+    keep = np.isfinite(desc_mean) & np.isfinite(desc_std) & (desc_std < 1e6) & (desc_std > 1e-6)
+    n_dropped = int((~keep).sum())
+    if n_dropped > 0:
+        dropped_names = [desc_names[i] for i in np.where(~keep)[0]]
+        print(f"[mtr] dropping {n_dropped} pathological descriptors: {dropped_names}", flush=True)
+    desc_names = [desc_names[i] for i in np.where(keep)[0]]
+    desc_mean = desc_mean[keep].astype(np.float32)
+    desc_std = desc_std[keep].astype(np.float32)
+    train_targets = train_targets[:, keep]
+    valid_targets = valid_targets[:, keep]
+    n_desc = len(desc_names)
+
+    # z-score per descriptor; clip outliers so loss isn't tail-dominated.
+    train_targets = (train_targets - desc_mean) / desc_std
+    valid_targets = (valid_targets - desc_mean) / desc_std
+    train_targets = np.clip(train_targets, -10.0, 10.0)
+    valid_targets = np.clip(valid_targets, -10.0, 10.0)
+
+    print(f"[mtr] n_desc={n_desc}, train={len(train_ids)}, valid={len(valid_ids)}", flush=True)
+
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(cfg.tf32)
+        torch.backends.cudnn.allow_tf32 = bool(cfg.tf32)
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    use_amp, amp_dtype, use_scaler, amp_label = _resolve_amp_mode(cfg.amp, dev)
+
+    ds_train = MTRDataset(train_ids, train_targets, max_seq_len=cfg.max_seq_len)
+    ds_valid = MTRDataset(valid_ids, valid_targets, max_seq_len=cfg.max_seq_len)
+    collate_fn = build_mtr_collate_fn(vocab.pad_id)
+    pin = dev.type == "cuda"
+    dl_kwargs: Dict[str, Any] = {
+        "batch_size": cfg.batch_size,
+        "shuffle": True,
+        "drop_last": True,
+        "collate_fn": collate_fn,
+        "pin_memory": pin,
+        "num_workers": max(0, cfg.num_data_workers),
+    }
+    if cfg.num_data_workers > 0:
+        dl_kwargs["prefetch_factor"] = max(2, cfg.prefetch_factor)
+        dl_kwargs["persistent_workers"] = True
+    loader_train = DataLoader(ds_train, **dl_kwargs)
+    dl_valid_kwargs = dict(dl_kwargs)
+    dl_valid_kwargs["shuffle"] = False
+    loader_valid = DataLoader(ds_valid, **dl_valid_kwargs)
+
+    encoder = MolRoBERTa(vocab_size=len(vocab.itos), cfg=cfg, pad_id=vocab.pad_id)
+    head = MTRHead(cfg.d_model, n_desc, dropout=cfg.dropout)
+
+    if cfg.torch_compile and hasattr(torch, "compile"):
+        try:
+            encoder = torch.compile(encoder)
+            head = torch.compile(head)
+            print("[mtr] torch.compile enabled", flush=True)
+        except Exception as exc:
+            print(f"[mtr] torch.compile fallback: {exc}", flush=True)
+
+    encoder.to(dev)
+    head.to(dev)
+    n_params = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in head.parameters())
+    print(f"[mtr] device={dev}, params={n_params} (~{n_params/1e6:.2f}M)", flush=True)
+    print(f"[mtr] amp={amp_label}, vocab_size={len(vocab.itos)}", flush=True)
+
+    all_params = list(encoder.parameters()) + list(head.parameters())
+    adamw_kwargs: Dict[str, Any] = {"lr": cfg.lr, "weight_decay": cfg.weight_decay}
+    if dev.type == "cuda":
+        adamw_kwargs["fused"] = True
+    try:
+        optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
+    except TypeError:
+        adamw_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    non_blocking = dev.type == "cuda"
+
+    total_steps = len(loader_train) * cfg.pretrain_epochs
+    warmup_steps = max(1, total_steps // 10)
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    history: List[Dict[str, Any]] = []
+    best_valid = float("inf")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, cfg.pretrain_epochs + 1):
+        encoder.train(); head.train()
+        train_losses = []
+        train_iter = iterable_with_progress(
+            loader_train, show_progress=show_progress,
+            total=len(loader_train),
+            desc=f"PretrainMTR[{representation}] ep{epoch}/{cfg.pretrain_epochs}",
+        )
+        for x, y, m in train_iter:
+            x = x.to(dev, non_blocking=non_blocking)
+            y = y.to(dev, non_blocking=non_blocking)
+            m = m.to(dev, non_blocking=non_blocking)
+            optimizer.zero_grad(set_to_none=True)
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+                if use_amp else nullcontext()
+            )
+            with amp_ctx:
+                cls_repr = encoder(x, return_cls=True)
+                preds = head(cls_repr)
+                # Masked MSE: ignore NaN entries
+                diff2 = (preds - y) ** 2
+                denom = m.sum().clamp_min(1.0)
+                loss = (diff2 * m).sum() / denom
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                scaler.step(optimizer); scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                optimizer.step()
+            scheduler.step()
+            train_losses.append(float(loss.item()))
+
+        encoder.eval(); head.eval()
+        valid_losses = []
+        with torch.no_grad():
+            for x, y, m in loader_valid:
+                x = x.to(dev, non_blocking=non_blocking)
+                y = y.to(dev, non_blocking=non_blocking)
+                m = m.to(dev, non_blocking=non_blocking)
+                amp_ctx = (
+                    torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+                    if use_amp else nullcontext()
+                )
+                with amp_ctx:
+                    cls_repr = encoder(x, return_cls=True)
+                    preds = head(cls_repr)
+                    diff2 = (preds - y) ** 2
+                    denom = m.sum().clamp_min(1.0)
+                    loss = (diff2 * m).sum() / denom
+                valid_losses.append(float(loss.item()))
+
+        t_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        v_loss = float(np.mean(valid_losses)) if valid_losses else float("nan")
+        history.append({"epoch": epoch, "train_mse": t_loss, "valid_mse": v_loss})
+        print(
+            f"[mtr] epoch {epoch}/{cfg.pretrain_epochs}  train_mse={t_loss:.4f}  valid_mse={v_loss:.4f}",
+            flush=True,
+        )
+        if v_loss < best_valid:
+            best_valid = v_loss
+            enc_to_save = encoder._orig_mod if hasattr(encoder, "_orig_mod") else encoder
+            head_to_save = head._orig_mod if hasattr(head, "_orig_mod") else head
+            torch.save({
+                "encoder_state": enc_to_save.state_dict(),
+                "mtr_head_state": head_to_save.state_dict(),
+                "cfg": {k: v for k, v in vars(cfg).items()},
+                "representation": representation,
+                "stamp_vocab": stamp_vocab,
+                "stamp_force_ring_aware_encode": bool(stamp_force_ring_aware_encode),
+                "objective": "mtr",
+                "n_descriptors": n_desc,
+                "descriptor_names": desc_names,
+                "descriptor_mean": desc_mean.tolist(),
+                "descriptor_std": desc_std.tolist(),
+            }, out_dir / "pretrained_roberta.pt")
+
+    (out_dir / "vocab.json").write_text(
+        json.dumps(vocab.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "pretrain_history.json").write_text(
+        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "pretrain_meta.json").write_text(
+        json.dumps({
+            "objective": "mtr",
+            "representation": representation,
+            "n_train": len(train_ids),
+            "n_valid": len(valid_ids),
+            "vocab_size": len(vocab.itos),
+            "n_descriptors": n_desc,
+            "n_params": n_params,
+            "best_valid_mse": best_valid,
+            "cfg": {k: v for k, v in vars(cfg).items()},
+            "device": str(dev),
+        }, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    return {
+        "output_dir": str(out_dir),
+        "history": history,
+        "best_valid_mse": best_valid,
+        "vocab_size": len(vocab.itos),
+        "n_params": n_params,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Load pre-trained model
 # ---------------------------------------------------------------------------
 
@@ -636,7 +1114,11 @@ def load_pretrained_roberta(
     model.to(dev)
     model.eval()
 
-    rep = build_representation(rep_name)
+    rep = build_representation(
+        rep_name,
+        stamp_vocab=ckpt.get("stamp_vocab"),
+        stamp_force_ring_aware_encode=ckpt.get("stamp_force_ring_aware_encode", False),
+    )
     return model, vocab, rep, cfg, dev
 
 
@@ -724,6 +1206,20 @@ _MOLECULENET_TASKS: Dict[str, Dict[str, Any]] = {
         "task_type": "regression",
         "metric": "rmse",
     },
+    "bace_regression": {
+        "dataset_name": "BACE_regression",
+        "target_column": "pIC50",
+        "smiles_column": "mol",
+        "task_type": "regression",
+        "metric": "rmse",
+    },
+    "clearance": {
+        "dataset_name": "Clearance",
+        "target_column": "exp",
+        "smiles_column": "smiles",
+        "task_type": "regression",
+        "metric": "rmse",
+    },
 }
 
 
@@ -743,6 +1239,10 @@ def load_moleculenet_task(
 
     task_info = _MOLECULENET_TASKS[task_key]
     data_root = str(data_dir) if data_dir else "."
+
+    presplit = _load_from_presplit_csv(task_key, task_info, data_root)
+    if presplit is not None:
+        return presplit
 
     try:
         return _load_via_deepchem(task_key, task_info, data_root, split_seed)
@@ -772,21 +1272,29 @@ def _load_via_deepchem(
         "esol": dc.molnet.load_delaney,
         "freesolv": dc.molnet.load_sampl,
         "lipophilicity": dc.molnet.load_lipo,
+        "bace_regression": dc.molnet.load_bace_regression,
+        "clearance": dc.molnet.load_clearance,
     }
     loader = loaders[task_key]
 
-    # scaffold split is standard for MoleculeNet; fallback to random
+    # scaffold split is standard for MoleculeNet; fallback to random.
+    # Pass transformers=[] to disable deepchem's default NormalizationTransformer
+    # for regression tasks — we want RAW labels here so our finetune-side
+    # z-score is the *only* normalization, and reported RMSE is in raw chemical
+    # units (matching how MoleculeNet results are conventionally reported).
     try:
         tasks_list, datasets, transformers = loader(
             featurizer=dc.feat.DummyFeaturizer(),
             splitter="scaffold",
             data_dir=data_root,
+            transformers=[],
         )
     except Exception:
         tasks_list, datasets, transformers = loader(
             featurizer=dc.feat.DummyFeaturizer(),
             splitter="random",
             data_dir=data_root,
+            transformers=[],
         )
 
     train_ds, valid_ds, test_ds = datasets
@@ -810,8 +1318,21 @@ def _load_via_deepchem(
                     col_idx = tasks_list.index(target_col)
                 else:
                     col_idx = 0
+                if hasattr(ds, "w") and ds.w is not None:
+                    w = ds.w[i]
+                    if hasattr(w, "__len__") and float(w[col_idx]) <= 0.0:
+                        continue
+                    if not hasattr(w, "__len__") and float(w) <= 0.0:
+                        continue
                 val = float(y[col_idx])
             else:
+                if hasattr(ds, "w") and ds.w is not None:
+                    w = ds.w[i]
+                    if hasattr(w, "__len__"):
+                        if len(w) > 0 and float(w[0]) <= 0.0:
+                            continue
+                    elif float(w) <= 0.0:
+                        continue
                 val = float(y)
             if not np.isfinite(val):
                 continue
@@ -820,9 +1341,9 @@ def _load_via_deepchem(
             rows.append((can, val))
         return rows
 
-    def _extract_multitask(ds) -> List[Tuple[str, List[float]]]:
-        """Return (smiles, [y_task1, y_task2, ...]) with NaN for missing."""
-        rows: List[Tuple[str, List[float]]] = []
+    def _extract_multitask(ds) -> List[Tuple[str, List[float], List[float]]]:
+        """Return (smiles, labels, masks), preserving DeepChem task masks."""
+        rows: List[Tuple[str, List[float], List[float]]] = []
         for i in range(len(ds)):
             smi = str(ds.ids[i])
             can = canonicalize_smiles(smi, strip_salts=True)
@@ -832,7 +1353,15 @@ def _load_via_deepchem(
             if not hasattr(y, "__len__"):
                 y = [float(y)]
             y_list = [float(v) for v in y]
-            rows.append((can, y_list))
+            w = getattr(ds, "w", None)
+            if w is None:
+                mask_list = [1.0 if np.isfinite(v) else 0.0 for v in y_list]
+            else:
+                wi = w[i]
+                if not hasattr(wi, "__len__"):
+                    wi = [float(wi)]
+                mask_list = [1.0 if float(v) > 0.0 and np.isfinite(y_list[j]) else 0.0 for j, v in enumerate(wi)]
+            rows.append((can, y_list, mask_list))
         return rows
 
     target = task_info["target_column"]
@@ -867,6 +1396,112 @@ def _load_via_deepchem(
     out["train_multi"] = _extract_multitask(train_ds)
     out["valid_multi"] = _extract_multitask(valid_ds)
     out["test_multi"] = _extract_multitask(test_ds)
+    return out
+
+
+def _load_from_presplit_csv(
+    task_key: str,
+    task_info: Dict[str, Any],
+    data_root: str,
+) -> Dict[str, Any] | None:
+    """Load externally provided train/valid/test CSVs, e.g. MoLFormer splits."""
+    root = Path(data_root)
+    split_root_candidates = [
+        root,
+        root / task_key,
+        root / task_info["dataset_name"],
+        root / "data" / task_key,
+        root / "data" / task_info["dataset_name"],
+    ]
+    split_root = None
+    for candidate in split_root_candidates:
+        if all((candidate / f"{split}.csv").exists() for split in ("train", "valid", "test")):
+            split_root = candidate
+            break
+    if split_root is None:
+        return None
+
+    smi_col = task_info["smiles_column"]
+    target_col = task_info["target_column"]
+    is_classification = task_info["task_type"] == "classification"
+
+    def _read_split(split: str) -> List[Tuple[str, float]]:
+        rows: List[Tuple[str, float]] = []
+        with (split_root / f"{split}.csv").open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                smi = (row.get(smi_col) or "").strip()
+                y_raw = (row.get(target_col) or "").strip()
+                if not smi or not y_raw:
+                    continue
+                can = canonicalize_smiles(smi, strip_salts=True)
+                if can is None:
+                    continue
+                try:
+                    y = float(y_raw)
+                except ValueError:
+                    continue
+                if not np.isfinite(y):
+                    continue
+                if is_classification and y not in (0.0, 1.0):
+                    continue
+                rows.append((can, y))
+        return rows
+
+    def _read_split_multitask(split: str) -> List[Tuple[str, List[float], List[float]]]:
+        rows: List[Tuple[str, List[float], List[float]]] = []
+        task_names: List[str] = []
+        with (split_root / f"{split}.csv").open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                task_names = [name for name in reader.fieldnames if name not in {smi_col, "mol_id"}]
+            for row in reader:
+                smi = (row.get(smi_col) or "").strip()
+                if not smi:
+                    continue
+                can = canonicalize_smiles(smi, strip_salts=True)
+                if can is None:
+                    continue
+                labels: List[float] = []
+                masks: List[float] = []
+                for name in task_names:
+                    raw = (row.get(name) or "").strip()
+                    if not raw:
+                        labels.append(0.0)
+                        masks.append(0.0)
+                        continue
+                    try:
+                        val = float(raw)
+                    except ValueError:
+                        labels.append(0.0)
+                        masks.append(0.0)
+                        continue
+                    labels.append(val if np.isfinite(val) else 0.0)
+                    masks.append(1.0 if np.isfinite(val) else 0.0)
+                rows.append((can, labels, masks))
+        return rows
+
+    tasks_list: List[str] = []
+    with (split_root / "train.csv").open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames:
+            tasks_list = [name for name in reader.fieldnames if name not in {smi_col, "mol_id"}]
+
+    out: Dict[str, Any] = {
+        "task": task_key,
+        "train": _read_split("train"),
+        "valid": _read_split("valid"),
+        "test": _read_split("test"),
+        "task_info": task_info,
+        "source": "presplit_csv",
+        "split_root": str(split_root),
+        "tasks_list": tasks_list,
+        "y_mean": 0.0,
+        "y_std": 1.0,
+    }
+    out["train_multi"] = _read_split_multitask("train")
+    out["valid_multi"] = _read_split_multitask("valid")
+    out["test_multi"] = _read_split_multitask("test")
     return out
 
 
@@ -970,6 +1605,36 @@ def _roc_auc(y_true: Sequence[int], y_score: Sequence[float]) -> float:
     return float((sum_pos_ranks - (n_pos * (n_pos + 1) / 2.0)) / (n_pos * n_neg))
 
 
+def _mean_multitask_auc(
+    y_true: Sequence[Sequence[float]],
+    y_score: Sequence[Sequence[float]],
+    y_mask: Sequence[Sequence[float]],
+    task_names: Sequence[str],
+) -> Tuple[float, Dict[str, float]]:
+    y_true_arr = np.asarray(y_true, dtype=np.float32)
+    y_score_arr = np.asarray(y_score, dtype=np.float32)
+    y_mask_arr = np.asarray(y_mask, dtype=np.float32)
+    if y_true_arr.ndim != 2 or y_score_arr.shape != y_true_arr.shape or y_mask_arr.shape != y_true_arr.shape:
+        return float("nan"), {}
+
+    auc_by_task: Dict[str, float] = {}
+    aucs: List[float] = []
+    for task_idx in range(y_true_arr.shape[1]):
+        keep = y_mask_arr[:, task_idx] > 0.0
+        name = task_names[task_idx] if task_idx < len(task_names) else f"task_{task_idx}"
+        if int(keep.sum()) == 0:
+            auc_by_task[name] = float("nan")
+            continue
+        auc = _roc_auc(
+            [int(v) for v in y_true_arr[keep, task_idx].tolist()],
+            [float(v) for v in y_score_arr[keep, task_idx].tolist()],
+        )
+        auc_by_task[name] = auc
+        if not math.isnan(auc):
+            aucs.append(auc)
+    return (float(np.mean(aucs)) if aucs else float("nan")), auc_by_task
+
+
 def _rmse(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
     if not y_true or len(y_true) != len(y_pred):
         return float("nan")
@@ -1000,10 +1665,18 @@ def finetune_roberta(
     device: Optional[str] = None,
     encode_workers: int = 1,
     encode_chunksize: int = 128,
+    multitask_classification: bool = False,
 ) -> Dict[str, Any]:
     """Fine-tune a pre-trained RoBERTa encoder on a MoleculeNet task (classification or regression)."""
     encoder, vocab, rep, pretrained_cfg, dev = load_pretrained_roberta(pretrained_dir, device=device)
-    cfg = cfg or pretrained_cfg
+    if cfg is None:
+        cfg = pretrained_cfg
+    else:
+        # Architectural params must match the loaded encoder; finetune cfg only
+        # carries optimization knobs (lr/bs/epochs/dropout/amp/...). Override
+        # them from pretrained_cfg so e.g. max_seq_len matches pos_emb size.
+        for _arch in ("d_model", "n_heads", "n_layers", "d_ff", "max_seq_len"):
+            setattr(cfg, _arch, getattr(pretrained_cfg, _arch))
 
     _set_seed(cfg.seed)
 
@@ -1016,6 +1689,13 @@ def finetune_roberta(
     task_data = load_moleculenet_task(task_name, data_dir=data_dir, split_seed=split_seed)
     task_info = task_data["task_info"]
     is_regression = task_info["task_type"] == "regression"
+    task_names = list(task_data.get("tasks_list") or [])
+    is_multitask_classification = (
+        bool(multitask_classification)
+        and not is_regression
+        and bool(task_data.get("train_multi"))
+        and len(task_names) > 1
+    )
     train_rows = task_data["train"]
     valid_rows = task_data["valid"]
     test_rows = task_data["test"]
@@ -1023,6 +1703,11 @@ def finetune_roberta(
         f"[finetune-roberta] train={len(train_rows)}, valid={len(valid_rows)}, test={len(test_rows)}",
         flush=True,
     )
+    if is_multitask_classification:
+        print(
+            f"[finetune-roberta] multi-task classification ON: n_tasks={len(task_names)}",
+            flush=True,
+        )
 
     # Encode SMILES → representation → token ids
     def _encode_rows(rows: List[Tuple[str, float]]) -> Tuple[List[List[int]], List[float]]:
@@ -1058,10 +1743,68 @@ def finetune_roberta(
 
         return encoded_ids, encoded_labels
 
+    def _encode_rows_multitask(rows: List[Tuple[str, List[float], List[float]]]) -> Tuple[List[List[int]], List[List[float]], List[List[float]]]:
+        encoded_ids: List[List[int]] = []
+        encoded_labels: List[List[float]] = []
+        encoded_masks: List[List[float]] = []
+        if encode_workers > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            from .lm import _encode_one_smiles_worker, _init_encode_worker
+
+            smiles_list = [smi for smi, _, _ in rows]
+            with ProcessPoolExecutor(
+                max_workers=encode_workers,
+                initializer=_init_encode_worker,
+                initargs=(
+                    rep.name,
+                    getattr(rep, "_vocab_path", None),
+                    getattr(rep, "_force_ring_aware_encode", False),
+                ),
+            ) as pool:
+                mapped = pool.map(_encode_one_smiles_worker, smiles_list, chunksize=encode_chunksize)
+                for (_, labels, masks), toks in zip(rows, mapped):
+                    if toks and sum(float(m) for m in masks) > 0:
+                        encoded_ids.append([vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id])
+                        encoded_labels.append([float(y) if np.isfinite(y) else 0.0 for y in labels])
+                        encoded_masks.append([float(m) for m in masks])
+            return encoded_ids, encoded_labels, encoded_masks
+
+        row_iter = iterable_with_progress(
+            rows,
+            show_progress=show_progress,
+            total=len(rows),
+            desc="encode-multitask",
+        )
+        for smi, labels, masks in row_iter:
+            try:
+                text = rep.encode(smi)
+                toks = rep.tokenize(text)
+                if toks and sum(float(m) for m in masks) > 0:
+                    encoded_ids.append([vocab.bos_id] + vocab.encode_tokens(toks) + [vocab.eos_id])
+                    encoded_labels.append([float(y) if np.isfinite(y) else 0.0 for y in labels])
+                    encoded_masks.append([float(m) for m in masks])
+            except Exception:
+                pass
+        return encoded_ids, encoded_labels, encoded_masks
+
     print(f"[finetune-roberta] Encoding datasets for {rep.name}...", flush=True)
-    train_ids, train_labels = _encode_rows(train_rows)
-    valid_ids, valid_labels = _encode_rows(valid_rows)
-    test_ids, test_labels = _encode_rows(test_rows)
+    train_multi_labels: List[List[float]] = []
+    valid_multi_labels: List[List[float]] = []
+    test_multi_labels: List[List[float]] = []
+    train_multi_masks: List[List[float]] = []
+    valid_multi_masks: List[List[float]] = []
+    test_multi_masks: List[List[float]] = []
+    if is_multitask_classification:
+        train_ids, train_multi_labels, train_multi_masks = _encode_rows_multitask(task_data["train_multi"])
+        valid_ids, valid_multi_labels, valid_multi_masks = _encode_rows_multitask(task_data["valid_multi"])
+        test_ids, test_multi_labels, test_multi_masks = _encode_rows_multitask(task_data["test_multi"])
+        train_labels: List[float] = []
+        valid_labels: List[float] = []
+        test_labels: List[float] = []
+    else:
+        train_ids, train_labels = _encode_rows(train_rows)
+        valid_ids, valid_labels = _encode_rows(valid_rows)
+        test_ids, test_labels = _encode_rows(test_rows)
     print(
         f"[finetune-roberta] encoded: train={len(train_ids)}, valid={len(valid_ids)}, test={len(test_ids)}",
         flush=True,
@@ -1083,14 +1826,19 @@ def finetune_roberta(
         test_labels = [(y - label_mean) / label_std for y in test_labels]
         print(f"[finetune-roberta] label normalization: mean={label_mean:.4f}, std={label_std:.4f}", flush=True)
 
-    ds_train = ClassificationDataset(train_ids, train_labels, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
-    ds_valid = ClassificationDataset(valid_ids, valid_labels, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
-    ds_test = ClassificationDataset(test_ids, test_labels, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
+    if is_multitask_classification:
+        ds_train = MultitaskClassificationDataset(train_ids, train_multi_labels, train_multi_masks, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
+        ds_valid = MultitaskClassificationDataset(valid_ids, valid_multi_labels, valid_multi_masks, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
+        ds_test = MultitaskClassificationDataset(test_ids, test_multi_labels, test_multi_masks, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
+    else:
+        ds_train = ClassificationDataset(train_ids, train_labels, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
+        ds_valid = ClassificationDataset(valid_ids, valid_labels, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
+        ds_test = ClassificationDataset(test_ids, test_labels, max_seq_len=cfg.max_seq_len, pad_id=vocab.pad_id)
 
     # AMP
     use_amp, amp_dtype, use_scaler, amp_label = _resolve_amp_mode(cfg.amp, dev)
 
-    collate_fn = build_cls_collate_fn(vocab.pad_id)
+    collate_fn = build_multitask_cls_collate_fn(vocab.pad_id) if is_multitask_classification else build_cls_collate_fn(vocab.pad_id)
     pin = dev.type == "cuda"
     dl_kwargs: Dict[str, Any] = {
         "batch_size": cfg.finetune_batch_size,
@@ -1109,6 +1857,8 @@ def finetune_roberta(
     # Task head
     if is_regression:
         head = RegressionHead(cfg.d_model, dropout=cfg.dropout)
+    elif is_multitask_classification:
+        head = ClassificationHead(cfg.d_model, n_classes=len(task_names), dropout=cfg.dropout)
     else:
         head = ClassificationHead(cfg.d_model, n_classes=1, dropout=cfg.dropout)
     head.to(dev)
@@ -1136,6 +1886,8 @@ def finetune_roberta(
 
     if is_regression:
         loss_fn = nn.MSELoss()
+    elif is_multitask_classification:
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
     else:
         loss_fn = nn.BCEWithLogitsLoss()
 
@@ -1157,7 +1909,13 @@ def finetune_roberta(
             total=len(loader_train),
             desc=f"Finetune[{task_name}] ep{epoch}/{cfg.finetune_epochs}",
         )
-        for x, y in train_iter:
+        for batch in train_iter:
+            if is_multitask_classification:
+                x, y, y_mask = batch
+                y_mask = y_mask.to(dev, non_blocking=non_blocking)
+            else:
+                x, y = batch
+                y_mask = None
             x = x.to(dev, non_blocking=non_blocking)
             y = y.to(dev, non_blocking=non_blocking)
             optimizer.zero_grad(set_to_none=True)
@@ -1167,8 +1925,13 @@ def finetune_roberta(
             )
             with amp_ctx:
                 cls_repr = encoder(x, return_cls=True)
-                preds = head(cls_repr).squeeze(-1)
-                loss = loss_fn(preds, y)
+                logits = head(cls_repr)
+                if is_multitask_classification:
+                    loss_raw = loss_fn(logits, y)
+                    loss = (loss_raw * y_mask).sum() / y_mask.sum().clamp_min(1.0)
+                else:
+                    preds = logits.squeeze(-1)
+                    loss = loss_fn(preds, y)
 
             if use_scaler:
                 scaler.scale(loss).backward()
@@ -1187,9 +1950,18 @@ def finetune_roberta(
         head.eval()
         valid_y_true: List[float] = []
         valid_y_pred: List[float] = []
+        valid_y_mask: List[List[float]] = []
+        valid_y_true_multi: List[List[float]] = []
+        valid_y_pred_multi: List[List[float]] = []
         valid_losses: List[float] = []
         with torch.no_grad():
-            for x, y in loader_valid:
+            for batch in loader_valid:
+                if is_multitask_classification:
+                    x, y, y_mask = batch
+                    y_mask = y_mask.to(dev, non_blocking=non_blocking)
+                else:
+                    x, y = batch
+                    y_mask = None
                 x = x.to(dev, non_blocking=non_blocking)
                 y = y.to(dev, non_blocking=non_blocking)
                 amp_ctx = (
@@ -1198,14 +1970,24 @@ def finetune_roberta(
                 )
                 with amp_ctx:
                     cls_repr = encoder(x, return_cls=True)
-                    preds = head(cls_repr).squeeze(-1)
-                    loss = loss_fn(preds, y)
+                    logits = head(cls_repr)
+                    if is_multitask_classification:
+                        loss_raw = loss_fn(logits, y)
+                        loss = (loss_raw * y_mask).sum() / y_mask.sum().clamp_min(1.0)
+                    else:
+                        preds = logits.squeeze(-1)
+                        loss = loss_fn(preds, y)
                 valid_losses.append(float(loss.item()))
-                if is_regression:
+                if is_multitask_classification:
+                    valid_y_pred_multi.extend(torch.sigmoid(logits).cpu().tolist())
+                    valid_y_true_multi.extend(y.cpu().tolist())
+                    valid_y_mask.extend(y_mask.cpu().tolist())
+                elif is_regression:
                     valid_y_pred.extend(preds.cpu().tolist())
                 else:
                     valid_y_pred.extend(torch.sigmoid(preds).cpu().tolist())
-                valid_y_true.extend(y.cpu().tolist())
+                if not is_multitask_classification:
+                    valid_y_true.extend(y.cpu().tolist())
 
         t_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         v_loss = float(np.mean(valid_losses)) if valid_losses else float("nan")
@@ -1230,6 +2012,23 @@ def finetune_roberta(
                 flush=True,
             )
             improved = not math.isnan(v_rmse) and v_rmse < best_valid_metric
+        elif is_multitask_classification:
+            v_auc, v_auc_by_task = _mean_multitask_auc(
+                valid_y_true_multi, valid_y_pred_multi, valid_y_mask, task_names
+            )
+            history.append({
+                "epoch": epoch,
+                "train_loss": t_loss,
+                "valid_loss": v_loss,
+                "valid_roc_auc": v_auc,
+                "valid_roc_auc_by_task": v_auc_by_task,
+            })
+            print(
+                f"[finetune-roberta] epoch {epoch}/{cfg.finetune_epochs}  "
+                f"train_loss={t_loss:.4f}  valid_loss={v_loss:.4f}  valid_mean_auc={v_auc:.4f}",
+                flush=True,
+            )
+            improved = not math.isnan(v_auc) and v_auc > best_valid_metric
         else:
             v_auc = _roc_auc([int(y) for y in valid_y_true], valid_y_pred)
             history.append({
@@ -1268,8 +2067,17 @@ def finetune_roberta(
     head.eval()
     test_y_true: List[float] = []
     test_y_pred: List[float] = []
+    test_y_true_multi: List[List[float]] = []
+    test_y_pred_multi: List[List[float]] = []
+    test_y_mask: List[List[float]] = []
     with torch.no_grad():
-        for x, y in loader_test:
+        for batch in loader_test:
+            if is_multitask_classification:
+                x, y, y_mask = batch
+                y_mask = y_mask.to(dev, non_blocking=non_blocking)
+            else:
+                x, y = batch
+                y_mask = None
             x = x.to(dev, non_blocking=non_blocking)
             y = y.to(dev, non_blocking=non_blocking)
             amp_ctx = (
@@ -1278,12 +2086,18 @@ def finetune_roberta(
             )
             with amp_ctx:
                 cls_repr = encoder(x, return_cls=True)
-                preds = head(cls_repr).squeeze(-1)
-            if is_regression:
+                logits = head(cls_repr)
+                preds = logits.squeeze(-1)
+            if is_multitask_classification:
+                test_y_pred_multi.extend(torch.sigmoid(logits).cpu().tolist())
+                test_y_true_multi.extend(y.cpu().tolist())
+                test_y_mask.extend(y_mask.cpu().tolist())
+            elif is_regression:
                 test_y_pred.extend(preds.cpu().tolist())
             else:
                 test_y_pred.extend(torch.sigmoid(preds).cpu().tolist())
-            test_y_true.extend(y.cpu().tolist())
+            if not is_multitask_classification:
+                test_y_true.extend(y.cpu().tolist())
 
     # Save
     out = Path(output_dir)
@@ -1308,6 +2122,32 @@ def finetune_roberta(
             "test_r2": test_r2_val,
             "best_valid_rmse": best_valid_metric,
             "best_epoch": best_epoch,
+            "n_train": len(train_ids),
+            "n_valid": len(valid_ids),
+            "n_test": len(test_ids),
+            "history": history,
+            "device": str(dev),
+        }
+    elif is_multitask_classification:
+        test_auc, test_auc_by_task = _mean_multitask_auc(
+            test_y_true_multi, test_y_pred_multi, test_y_mask, task_names
+        )
+        print(
+            f"[finetune-roberta] Test mean ROC-AUC={test_auc:.4f}  (best_epoch={best_epoch})",
+            flush=True,
+        )
+        results = {
+            "task": task_name,
+            "task_type": "classification",
+            "multitask_classification": True,
+            "representation": rep.name,
+            "pretrained_dir": str(pretrained_dir),
+            "test_roc_auc": test_auc,
+            "test_roc_auc_by_task": test_auc_by_task,
+            "best_valid_roc_auc": best_valid_metric,
+            "best_epoch": best_epoch,
+            "n_tasks": len(task_names),
+            "task_names": task_names,
             "n_train": len(train_ids),
             "n_valid": len(valid_ids),
             "n_test": len(test_ids),
@@ -1346,6 +2186,7 @@ def finetune_roberta(
             "representation": rep.name,
             "task": task_name,
             "task_type": task_info["task_type"],
+            "multitask_classification": bool(is_multitask_classification),
             "label_mean": label_mean,
             "label_std": label_std,
         }, out / "finetuned_model.pt")
