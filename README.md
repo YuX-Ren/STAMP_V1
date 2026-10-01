@@ -64,6 +64,11 @@ not versioned. Keep them under `data/`, `results/`, or another external storage
 location. Many HPC scripts contain site-specific defaults; override their
 environment variables and paths for a different cluster.
 
+The matching data snapshot is hosted separately in the private
+[`bi0s/STAMP_V1-data`](https://huggingface.co/datasets/bi0s/STAMP_V1-data)
+Hugging Face dataset. Download it and copy `main/data/` into this checkout's
+`data/` directory; the dataset card includes provenance and SHA-256 checksums.
+
 Optional representation implementations can be installed as packages or cloned
 under `third_party/`. See [the experiment guide](docs/experiments.md) and
 [the runbook](docs/experiments_runbook.md) for the expected layout and commands.
