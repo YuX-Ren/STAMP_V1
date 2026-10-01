@@ -1,0 +1,18 @@
+#!/bin/bash
+#PBS -N stamp_bank_jnk3
+#PBS -P CFP03-CF-130
+#PBS -l select=1:ncpus=12:mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd /nfs/home/svu/yuxuan.ren/STAMP_V1.5
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+export TOKENIZERS_PARALLELISM=false
+
+TASK=jnk3 \
+SKIP_IF_EXISTS=0 \
+BANK_WORKERS=12 \
+BANK_CHUNK_SIZE=2000 \
+bash scripts/hpc/build_stamp_pmo_bank_task.sh

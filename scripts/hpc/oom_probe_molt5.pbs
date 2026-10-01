@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molt5_oom_probe
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=64gb
+
+# Probe max per-GPU batch size for the MolT5 single-view zinc_curated_30k config.
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+export TOKENIZERS_PARALLELISM=false
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
+
+python scripts/benchmark/oom_probe_molt5.py \
+  --init-model /scratch/yuxuan.ren/models/t5-v1_1-base \
+  --stamp-vocab /scratch/yuxuan.ren/data/ckpt_stamp/zinc_curated_vocab_30k_legacy/motif_vocab.txt \
+  --max-source-len 512 \
+  --max-target-len 96 \
+  --sizes 16,24,32,48,64,96,128 \
+  --amp bf16 2>&1
+
+echo "[INFO] End=$(date)"

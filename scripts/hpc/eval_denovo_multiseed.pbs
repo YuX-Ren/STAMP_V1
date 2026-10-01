@@ -1,0 +1,120 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_denovo_ms
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=80gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${MODEL_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/zinc_l3_full_aogpt_qedsa_top12k_2g/legacy_tree}"
+: "${OUT_DIR:=${MODEL_DIR}/eval_multiseed_qedhigh_salow}"
+: "${SEEDS:=400042 400043 400044 400045 400046}"
+: "${NUM_SAMPLES:=1024}"
+: "${BATCH_SIZE:=128}"
+: "${TEMP:=0.7}"
+: "${TOPK:=0}"
+: "${TOPP:=0.95}"
+: "${MAX_NEW:=255}"
+: "${CONDITION_MODE:=qed_sa}"
+: "${CONDITION_TOKENS:=}"
+: "${AO_DECODE_MODE:=ar}"
+: "${AO_CANVAS_PLACEHOLDER:=unk}"
+: "${DEDUP_FILL:=0}"
+: "${OVERSAMPLE_FACTOR:=3.0}"
+
+export OMP_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+export OUT_DIR
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] MODEL_DIR=${MODEL_DIR}"
+echo "[INFO] OUT_DIR=${OUT_DIR}"
+echo "[INFO] SEEDS=${SEEDS}"
+echo "[INFO] NUM_SAMPLES=${NUM_SAMPLES} BATCH_SIZE=${BATCH_SIZE} TEMP=${TEMP} TOPK=${TOPK} TOPP=${TOPP} MAX_NEW=${MAX_NEW}"
+echo "[INFO] CONDITION_MODE=${CONDITION_MODE} CONDITION_TOKENS=${CONDITION_TOKENS}"
+echo "[INFO] AO_DECODE_MODE=${AO_DECODE_MODE} AO_CANVAS_PLACEHOLDER=${AO_CANVAS_PLACEHOLDER}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+
+DEDUP_ARGS=()
+if [[ "${DEDUP_FILL}" == "1" ]]; then
+  DEDUP_ARGS=(--dedup-fill --oversample-factor "${OVERSAMPLE_FACTOR}")
+fi
+
+for SEED in ${SEEDS}; do
+  SEED_OUT="${OUT_DIR}/seed_${SEED}"
+  mkdir -p "${SEED_OUT}"
+  echo "[INFO] Eval seed=${SEED} start=$(date)"
+  python -u scripts/benchmark/eval_denovo_taskaware.py \
+    --model-dir "${MODEL_DIR}" \
+    --output-dir "${SEED_OUT}" \
+    --num-samples "${NUM_SAMPLES}" \
+    --batch-size "${BATCH_SIZE}" \
+    --temperature "${TEMP}" \
+    --top-k "${TOPK}" \
+    --top-p "${TOPP}" \
+    --max-new "${MAX_NEW}" \
+    --device cuda \
+    --seed "${SEED}" \
+    --condition-mode "${CONDITION_MODE}" \
+    --condition-tokens "${CONDITION_TOKENS}" \
+    --ao-decode-mode "${AO_DECODE_MODE}" \
+    --ao-canvas-placeholder "${AO_CANVAS_PLACEHOLDER}" \
+    "${DEDUP_ARGS[@]}" \
+    2>&1 | tee "${SEED_OUT}/eval.log"
+done
+
+python - <<'PY'
+import json
+import math
+import os
+from pathlib import Path
+
+out_dir = Path(os.environ["OUT_DIR"])
+rows = []
+for p in sorted(out_dir.glob("seed_*/denovo_eval.json")):
+    data = json.loads(p.read_text())
+    seed = p.parent.name.removeprefix("seed_")
+    data["seed"] = int(seed)
+    rows.append(data)
+
+def mean(key: str) -> float:
+    vals = [float(r[key]) for r in rows]
+    return sum(vals) / len(vals) if vals else float("nan")
+
+def std(key: str) -> float:
+    vals = [float(r[key]) for r in rows]
+    if len(vals) < 2:
+        return float("nan")
+    m = sum(vals) / len(vals)
+    return math.sqrt(sum((x - m) ** 2 for x in vals) / (len(vals) - 1))
+
+summary = {
+    "n_seeds": len(rows),
+    "seeds": [r["seed"] for r in rows],
+    "per_seed": rows,
+    "mean": {k: mean(k) for k in ["validity", "uniqueness", "quality", "raw_validity", "raw_uniqueness", "raw_quality"] if rows and k in rows[0]},
+    "std": {k: std(k) for k in ["validity", "uniqueness", "quality", "raw_validity", "raw_uniqueness", "raw_quality"] if rows and k in rows[0]},
+}
+(out_dir / "multiseed_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+print("[INFO] Multiseed summary")
+for r in rows:
+    print(
+        f"seed={r['seed']} V={r['validity']:.2f} U={r['uniqueness']:.2f} Q={r['quality']:.2f} "
+        f"n_valid={r['n_valid']} n_unique={r['n_unique']} hq={r['n_high_quality_unique']}"
+    )
+for key in ["validity", "uniqueness", "quality"]:
+    print(f"{key}: mean={summary['mean'][key]:.2f} std={summary['std'][key]:.2f}")
+PY
+
+echo "[INFO] End=$(date)"

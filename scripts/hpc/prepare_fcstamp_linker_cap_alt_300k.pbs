@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N prep_lnk_capalt
+#PBS -P CFP03-CF-130
+#PBS -l select=1:ngpus=1:ncpus=12:mem=64gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd /nfs/home/svu/yuxuan.ren/STAMP_V1.5
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0
+
+PY=/scratch/yuxuan.ren/miniconda3/envs/stamp-train-rdkit-2025_09_4/bin/python
+
+"${PY}" scripts/benchmark/prepare_fcstamp_finetune_data.py \
+  --parquet /scratch/yuxuan.ren/data/zinc_full_condition/*_stamp.parquet \
+  --out /scratch/yuxuan.ren/data/fcstamp_linker_cap_alt_300k.parquet \
+  --text-column stamp_smiles \
+  --smiles-column smiles \
+  --split-column split_random \
+  --all-pass-column all_pass \
+  --use-existing-split \
+  --tasks linker_design \
+  --task-quotas linker_design:300000 \
+  --max-output-rows 300000 \
+  --tasks-per-mol 1 \
+  --variants-per-task 8 \
+  --min-mask-groups 1 \
+  --max-mask-groups 4 \
+  --linker-min-target-tokens 0 \
+  --length-strategy uniform_length \
+  --max-total-tokens 256 \
+  --batch-size 8192 \
+  --write-batch-size 50000 \
+  --seed 20260525 \
+  --linker-middle-frequency-cap 1 \
+  --linker-target-motif-tuple-cap 5 \
+  --linker-target-motif-token-cap 5000 \
+  --linker-boundary-frequency-cap 200 \
+  --linker-min-boundary-alternatives 2 \
+  --linker-boundary-signature motif

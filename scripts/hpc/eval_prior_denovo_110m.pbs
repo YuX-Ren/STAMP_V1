@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_denovo_110m
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=32gb
+
+set -u
+: "${CKPT_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/ao_l1_l3_110m_notaskaware/legacy_tree_ep30}"
+: "${N:=1024}"
+: "${T:=0.5}"
+: "${K:=10}"
+: "${MAX_NEW:=64}"
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+CKPT_DIR=${CKPT_DIR} N=${N} T=${T} K=${K} MAX_NEW=${MAX_NEW} \
+  bash /home/svu/yuxuan.ren/run_prior_denovo.sh

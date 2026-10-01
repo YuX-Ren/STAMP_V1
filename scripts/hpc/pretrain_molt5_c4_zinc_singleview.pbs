@@ -1,0 +1,131 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molt5_sv_zc30k
+#PBS -l walltime=72:00:00
+#PBS -l select=1:ngpus=4:ncpus=32:mem=450gb
+
+# MolT5 c4+zinc mixed pretrain, FRESH SINGLE-VIEW STAMP.
+# Non-ring-aware, chembl-mined 32k-token vocab (0.92% UNK on ZINC).
+# STAMP tokens sit compact (median 30, p99 55) so max_source_len=192 is
+# plenty. This job restarts pretrain from t5-v1.1-base — NOT resume from
+# the prior msring 413k ckpt (encoding is incompatible).
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${C4_TRAIN_GLOB:=/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/data/c4/en/c4-train.*.json.gz}"
+: "${C4_VALID_GLOB:=/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/data/c4/en/c4-validation.*.json.gz}"
+: "${C4_STREAMING:=0}"
+: "${C4_DATASET_NAME:=allenai/c4}"
+: "${C4_CONFIG_NAME:=en}"
+: "${C4_TRAIN_SPLIT:=train}"
+: "${C4_VALID_SPLIT:=validation}"
+
+# One held-out shard as validation (00000), remaining shards 00001..00042 as train.
+# Two globs comma-separated because the python side globs each part independently:
+#   00001..00009 via train_0000[1-9]-of-*
+#   00010..00042 via train_000[1-4][0-9]-of-*  (non-existent 00043..49 silently drop)
+: "${ZINC_TRAIN_PARQUET:=/scratch/yuxuan.ren/data/zinc_curated30k_stamp/train_0000[1-9]-of-00178_stamp.parquet,/scratch/yuxuan.ren/data/zinc_curated30k_stamp/train_000[1-4][0-9]-of-00178_stamp.parquet}"
+: "${ZINC_VALID_PARQUET:=/scratch/yuxuan.ren/data/zinc_curated30k_stamp/train_00000-of-00178_stamp.parquet}"
+
+: "${ZINC_COLUMN:=stamp}"
+: "${MOLECULE_FORMAT:=stamp}"
+: "${STAMP_VOCAB:=/scratch/yuxuan.ren/data/ckpt_stamp/zinc_curated_vocab_30k_legacy/motif_vocab.txt}"
+: "${STAMP_TOKEN_LIMIT:=0}"          # 0 = add ALL 32036 tokens from the vocab
+: "${STAMP_STRUCTURAL_MAX_INDEX:=255}"
+: "${OUT_DIR:=/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/ckpt/molt5_c4_zinc_singleview_zinc_curated30k_t5v11base_4g_$(date +%Y%m%d_%H%M%S)}"
+: "${TOKENIZER:=/scratch/yuxuan.ren/models/t5-v1_1-base}"
+: "${INIT_MODEL:=/scratch/yuxuan.ren/models/t5-v1_1-base}"
+
+: "${NPROC_PER_NODE:=4}"
+: "${MAX_SOURCE_LEN:=192}"           # Down from 512: single-view STAMP is very compact.
+: "${MAX_TARGET_LEN:=96}"            # Denoise target ≈ 15% of source + sentinels.
+: "${BATCH_SIZE:=256}"
+: "${GLOBAL_BATCH_SIZE:=1024}"
+: "${MAX_STEPS:=500000}"
+: "${LR:=1.4e-4}"
+: "${WARMUP_STEPS:=5000}"
+: "${SAVE_EVERY_STEPS:=1000}"
+: "${EVAL_EVERY_STEPS:=10000}"
+: "${EVAL_MAX_BATCHES:=100}"
+: "${C4_TRAIN_MAX_ROWS:=0}"
+: "${ZINC_TRAIN_MAX_ROWS:=100000000}"
+: "${C4_VALID_MAX_ROWS:=20000}"
+: "${ZINC_VALID_MAX_ROWS:=20000}"
+: "${NUM_DATA_WORKERS:=4}"
+: "${AMP:=bf16}"
+: "${RESUME_FROM:=}"
+
+export OMP_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+if [[ ! -f "${STAMP_VOCAB}" ]]; then
+  echo "[ERROR] STAMP_VOCAB not found: ${STAMP_VOCAB}" >&2
+  exit 2
+fi
+if [[ ! -f "${ZINC_VALID_PARQUET}" ]]; then
+  echo "[ERROR] ZINC_VALID_PARQUET not found: ${ZINC_VALID_PARQUET}" >&2
+  exit 2
+fi
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] OUT_DIR=${OUT_DIR}"
+echo "[INFO] STAMP_VOCAB=${STAMP_VOCAB} STAMP_TOKEN_LIMIT=${STAMP_TOKEN_LIMIT}"
+echo "[INFO] ZINC_TRAIN_PARQUET=${ZINC_TRAIN_PARQUET}"
+echo "[INFO] ZINC_VALID_PARQUET=${ZINC_VALID_PARQUET}"
+echo "[INFO] MAX_SOURCE_LEN=${MAX_SOURCE_LEN} MAX_TARGET_LEN=${MAX_TARGET_LEN}"
+echo "[INFO] BATCH_SIZE=${BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} MAX_STEPS=${MAX_STEPS}"
+
+RESUME_ARG=()
+if [[ -n "${RESUME_FROM}" ]]; then
+  RESUME_ARG=(--resume-from "${RESUME_FROM}")
+fi
+
+torchrun \
+  --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/benchmark/train_molt5_c4_zinc_mixed.py \
+    --c4-train-glob "${C4_TRAIN_GLOB}" \
+    --c4-valid-glob "${C4_VALID_GLOB}" \
+    --c4-dataset-name "${C4_DATASET_NAME}" \
+    --c4-config-name "${C4_CONFIG_NAME}" \
+    --c4-train-split "${C4_TRAIN_SPLIT}" \
+    --c4-valid-split "${C4_VALID_SPLIT}" \
+    --zinc-train-parquet "${ZINC_TRAIN_PARQUET}" \
+    --zinc-valid-parquet "${ZINC_VALID_PARQUET}" \
+    --zinc-column "${ZINC_COLUMN}" \
+    --molecule-format "${MOLECULE_FORMAT}" \
+    --stamp-vocab "${STAMP_VOCAB}" \
+    --stamp-token-limit "${STAMP_TOKEN_LIMIT}" \
+    --stamp-structural-max-index "${STAMP_STRUCTURAL_MAX_INDEX}" \
+    --output-dir "${OUT_DIR}" \
+    --tokenizer "${TOKENIZER}" \
+    --init-model "${INIT_MODEL}" \
+    --max-source-len "${MAX_SOURCE_LEN}" \
+    --max-target-len "${MAX_TARGET_LEN}" \
+    --batch-size "${BATCH_SIZE}" \
+    --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+    --max-steps "${MAX_STEPS}" \
+    --lr "${LR}" \
+    --warmup-steps "${WARMUP_STEPS}" \
+    --save-every-steps "${SAVE_EVERY_STEPS}" \
+    --eval-every-steps "${EVAL_EVERY_STEPS}" \
+    --eval-max-batches "${EVAL_MAX_BATCHES}" \
+    --c4-train-max-rows "${C4_TRAIN_MAX_ROWS}" \
+    --zinc-train-max-rows "${ZINC_TRAIN_MAX_ROWS}" \
+    --c4-valid-max-rows "${C4_VALID_MAX_ROWS}" \
+    --zinc-valid-max-rows "${ZINC_VALID_MAX_ROWS}" \
+    --num-data-workers "${NUM_DATA_WORKERS}" \
+    --amp "${AMP}" \
+    "${RESUME_ARG[@]}" 2>&1
+
+echo "[INFO] End=$(date)"

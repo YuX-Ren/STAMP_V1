@@ -1,0 +1,121 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_mdlm_30m
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=96gb
+
+set -euo pipefail
+
+# Paths (override via `qsub -v VAR=value,...`)
+: "${REPO_ROOT:=/home/svu/yuxuan.ren/STAMP_V1.5}"
+: "${CONDA_ENV:=stamp-train-rdkit-2025_09_4}"
+: "${PARQUET:=/scratch/yuxuan.ren/data/dataset_stamp.parquet}"
+: "${STAMP_VOCAB:=/scratch/yuxuan.ren/data/v3_cm_union.txt}"
+: "${CKPT_ROOT:=/scratch/yuxuan.ren/data/ckpt_stamp}"
+: "${RUN_NAME:=stamp_mdlm_30m_d512_l8_e3}"
+: "${OUTPUT_DIR:=${CKPT_ROOT}/${RUN_NAME}}"
+
+# Data
+: "${TEXT_COLUMN:=stamp_smiles}"
+: "${SPLIT_COLUMN:=split_random}"
+: "${TRAIN_SPLIT:=train}"
+: "${VALID_SPLIT:=val}"
+: "${TRAIN_MAX_ROWS:=0}"
+: "${VALID_MAX_ROWS:=20000}"
+
+# Model (small quick-test config; AR baseline ran 10ep/d=768/l=12 in ~3h,
+# so d=512/l=8 × 3ep finishes in well under 1h)
+: "${D_MODEL:=512}"
+: "${N_HEADS:=8}"
+: "${N_LAYERS:=8}"
+: "${D_FF:=2048}"
+: "${DROPOUT:=0.1}"
+: "${MAX_SEQ_LEN:=64}"
+: "${BATCH_SIZE:=4096}"
+: "${GLOBAL_BATCH_SIZE:=4096}"
+: "${LR:=5e-4}"
+: "${WEIGHT_DECAY:=0.01}"
+: "${EPOCHS:=3}"
+: "${AMP:=bf16}"
+: "${NUM_DATA_WORKERS:=8}"
+: "${PREFETCH_FACTOR:=6}"
+: "${TORCH_COMPILE:=0}"
+: "${REUSE_SCAN_CACHE:=0}"    # scan-cache must contain <mask>; force fresh scan first run
+: "${NO_TQDM:=1}"
+
+# Diffusion
+: "${DIFF_EPS:=1e-3}"
+: "${DIFF_SCHEDULER:=linear}"
+: "${DIFF_LOSS_WEIGHT:=scheduler}"
+
+: "${RESUME_FROM:=}"
+
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+cd "${REPO_ROOT}"
+
+mkdir -p "${OUTPUT_DIR}"
+LOG_DIR="${OUTPUT_DIR}/logs"
+mkdir -p "${LOG_DIR}"
+STAMP_TS="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_DIR}/train_${STAMP_TS}.log"
+
+echo "[INFO] Host: $(hostname)"
+echo "[INFO] Start: $(date)"
+echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] Model: d=${D_MODEL} L=${N_LAYERS} H=${N_HEADS} ff=${D_FF} seq=${MAX_SEQ_LEN}"
+echo "[INFO] Batch: micro=${BATCH_SIZE} global=${GLOBAL_BATCH_SIZE} epochs=${EPOCHS} amp=${AMP}"
+echo "[INFO] Diffusion: eps=${DIFF_EPS} scheduler=${DIFF_SCHEDULER} loss_weight=${DIFF_LOSS_WEIGHT}"
+echo "[INFO] LOG_FILE=${LOG_FILE}"
+
+nvidia-smi || true
+
+ARGS=(
+  scripts/benchmark/train_stamp_diffusion_parquet.py
+  --parquet        "${PARQUET}"
+  --stamp-vocab    "${STAMP_VOCAB}"
+  --output-dir     "${OUTPUT_DIR}"
+  --text-column    "${TEXT_COLUMN}"
+  --split-column   "${SPLIT_COLUMN}"
+  --train-split    "${TRAIN_SPLIT}"
+  --valid-split    "${VALID_SPLIT}"
+  --train-max-rows "${TRAIN_MAX_ROWS}"
+  --valid-max-rows "${VALID_MAX_ROWS}"
+  --epochs         "${EPOCHS}"
+  --d-model        "${D_MODEL}"
+  --n-heads        "${N_HEADS}"
+  --n-layers       "${N_LAYERS}"
+  --d-ff           "${D_FF}"
+  --dropout        "${DROPOUT}"
+  --max-seq-len    "${MAX_SEQ_LEN}"
+  --batch-size     "${BATCH_SIZE}"
+  --global-batch-size "${GLOBAL_BATCH_SIZE}"
+  --lr             "${LR}"
+  --weight-decay   "${WEIGHT_DECAY}"
+  --amp            "${AMP}"
+  --num-data-workers  "${NUM_DATA_WORKERS}"
+  --prefetch-factor   "${PREFETCH_FACTOR}"
+  --diffusion-time-epsilon "${DIFF_EPS}"
+  --diffusion-scheduler    "${DIFF_SCHEDULER}"
+  --diffusion-loss-weight  "${DIFF_LOSS_WEIGHT}"
+  --device cuda:0
+)
+[[ "${NO_TQDM}" == "1" ]]           && ARGS+=(--no-tqdm)
+[[ "${REUSE_SCAN_CACHE}" == "1" ]]  && ARGS+=(--reuse-scan-cache)
+[[ -n "${RESUME_FROM}" ]]           && ARGS+=(--resume-from "${RESUME_FROM}")
+if [[ "${TORCH_COMPILE}" == "1" ]]; then
+  ARGS+=(--torch-compile)
+else
+  ARGS+=(--no-torch-compile)
+fi
+
+python "${ARGS[@]}" 2>&1 | tee "${LOG_FILE}"
+
+echo "[INFO] End: $(date)"
+echo "[INFO] Checkpoints: ${OUTPUT_DIR}/model.pt  +  ${OUTPUT_DIR}/checkpoints/epoch_*.pt"

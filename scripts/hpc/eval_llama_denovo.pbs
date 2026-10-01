@@ -1,0 +1,47 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N llama_denovo
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=48gb
+
+# De novo Q eval of a trained Llama AR model, GenMol-style metric
+# (dedup unique SMILES first, then QED>=0.6 & SA<=4, / num_samples).
+# Settings matched to the prior atom-level baseline's best point
+# (temp=0.5, top_k=10) so Q is directly comparable to prior 79%.
+# MODEL_DIR defaults to the 2-GPU 10M run; override via `qsub -v MODEL_DIR=...`.
+
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+MODEL_DIR=${MODEL_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/llama_10m_test_2g/legacy_tree}
+OUTPUT_DIR=${OUTPUT_DIR:-${MODEL_DIR}/denovo_eval}
+NUM_SAMPLES=${NUM_SAMPLES:-2000}
+
+export TOKENIZERS_PARALLELISM=false
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUTPUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] MODEL_DIR=${MODEL_DIR}  NUM_SAMPLES=${NUM_SAMPLES}"
+
+# Llama trained WITH the 51K motif vocab → keep the motif tokenizer
+# (do NOT pass --no-motif-tokenizer; that is only for prior atom-level ckpts).
+python scripts/benchmark/eval_denovo_taskaware.py \
+  --model-dir "${MODEL_DIR}" \
+  --output-dir "${OUTPUT_DIR}" \
+  --num-samples "${NUM_SAMPLES}" \
+  --batch-size 250 \
+  --temperature 0.5 \
+  --top-k 10 \
+  --top-p 1.0 \
+  --max-new 80 \
+  --device cuda \
+  --seed 0 2>&1
+
+echo "[INFO] End=$(date)"
+echo "[INFO] Result: ${OUTPUT_DIR}"

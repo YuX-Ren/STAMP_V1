@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_hybrid
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=4:mem=32gb
+
+set -u
+: "${EPOCH:=0009}"
+: "${N:=1024}"
+: "${TEMPERATURE:=1.0}"
+: "${TOP_K:=50}"
+export EPOCH N TEMPERATURE TOP_K
+bash /home/svu/yuxuan.ren/STAMP_V1.5/scripts/hpc/eval_hybrid_ep10.sh

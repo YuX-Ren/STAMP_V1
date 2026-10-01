@@ -1,0 +1,41 @@
+#!/bin/bash
+#PBS -N prep_scf_redes
+#PBS -P CFP03-CF-130
+#PBS -l select=1:ngpus=1:ncpus=12:mem=64gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd /nfs/home/svu/yuxuan.ren/STAMP_V1.5
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0
+
+PY=/scratch/yuxuan.ren/miniconda3/envs/stamp-train-rdkit-2025_09_4/bin/python
+OUT_DIR=/scratch/yuxuan.ren/data/fcstamp_redesign_scaffold_super
+mkdir -p "${OUT_DIR}"
+
+"${PY}" scripts/benchmark/prepare_fcstamp_finetune_data.py \
+  --parquet /scratch/yuxuan.ren/data/zinc_full_condition/*_stamp.parquet \
+  --out "${OUT_DIR}/scaffold_super_shared_300k.parquet" \
+  --text-column stamp_smiles \
+  --smiles-column smiles \
+  --split-column split_random \
+  --all-pass-column all_pass \
+  --use-existing-split \
+  --tasks scaffold_decoration superstructure_generation \
+  --task-quotas scaffold_decoration:150000,superstructure_generation:150000 \
+  --max-output-rows 300000 \
+  --tasks-per-mol 2 \
+  --variants-per-task 4 \
+  --min-mask-groups 1 \
+  --max-mask-groups 4 \
+  --min-keep-fraction 0.3 \
+  --max-keep-fraction 1.0 \
+  --length-strategy candidate \
+  --max-total-tokens 256 \
+  --batch-size 8192 \
+  --write-batch-size 50000 \
+  --seed 20260525 \
+  --no-strip-stereo \
+  --no-scaffold-linker-fallback

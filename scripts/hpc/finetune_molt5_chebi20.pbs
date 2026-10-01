@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molt5_ft_chebi20
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ngpus=1:ncpus=12:mem=96gb
+
+# Fine-tune MolT5 c4+zinc pretrain (step_00413000) on ChEBI-20.
+# Direction selected via DIRECTION={mol2text,text2mol} qsub -v.
+#   qsub -v DIRECTION=mol2text scripts/hpc/finetune_molt5_chebi20.pbs
+#   qsub -v DIRECTION=text2mol scripts/hpc/finetune_molt5_chebi20.pbs
+
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+# INIT_CKPT should point at a checkpoint from the fresh single-view pretrain
+# (zinc_curated_30k vocab); override via `qsub -v INIT_CKPT=...`. The default here is
+# just a placeholder until the fresh pretrain lands its first useful checkpoint.
+INIT_CKPT=${INIT_CKPT:-/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/ckpt/molt5_c4_zinc_singleview_zinc_curated30k_t5v11base_4g_TBD/checkpoints/step_00300000}
+DATA_DIR=/scratch/yuxuan.ren/data/chebi20/finetune_zinc_curated30k
+
+DIRECTION=${DIRECTION:-mol2text}
+if [[ "${DIRECTION}" == "mol2text" ]]; then
+  SRC_COL=mol2text_source
+  TGT_COL=mol2text_target
+elif [[ "${DIRECTION}" == "text2mol" ]]; then
+  SRC_COL=text2mol_source
+  TGT_COL=text2mol_target
+else
+  echo "[ERROR] Unknown DIRECTION=${DIRECTION}"; exit 2
+fi
+
+OUT_DIR=${OUT_DIR:-/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/ckpt/molt5_chebi20_${DIRECTION}_zc30k}
+EPOCHS=${EPOCHS:-30}
+BATCH=${BATCH:-32}
+LR=${LR:-5e-4}
+EVAL_EVERY=${EVAL_EVERY:-500}
+MAX_SRC=${MAX_SRC:-256}
+MAX_TGT=${MAX_TGT:-256}
+DROPOUT=${DROPOUT:-}                     # empty = don't override model default 0.1
+WARMUP_RATIO=${WARMUP_RATIO:-0.05}
+PATIENCE=${PATIENCE:-6}
+GRAD_ACCUM=${GRAD_ACCUM:-1}
+LR_SCHEDULE=${LR_SCHEDULE:-linear}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
+LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.0}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+export TOKENIZERS_PARALLELISM=false
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] DIRECTION=${DIRECTION} SRC_COL=${SRC_COL} TGT_COL=${TGT_COL}"
+echo "[INFO] INIT_CKPT=${INIT_CKPT}"
+echo "[INFO] OUT_DIR=${OUT_DIR} EPOCHS=${EPOCHS} BATCH=${BATCH} LR=${LR}"
+
+DROPOUT_ARG=()
+if [[ -n "${DROPOUT}" ]]; then DROPOUT_ARG=(--dropout "${DROPOUT}"); fi
+
+python scripts/benchmark/finetune_molt5_chebi20.py \
+  --init-ckpt "${INIT_CKPT}" \
+  --train-parquet "${DATA_DIR}/train.parquet" \
+  --valid-parquet "${DATA_DIR}/validation.parquet" \
+  --source-column "${SRC_COL}" \
+  --target-column "${TGT_COL}" \
+  --output-dir "${OUT_DIR}" \
+  --max-source-len "${MAX_SRC}" \
+  --max-target-len "${MAX_TGT}" \
+  --batch-size "${BATCH}" \
+  --grad-accum "${GRAD_ACCUM}" \
+  --epochs "${EPOCHS}" \
+  --lr "${LR}" \
+  --warmup-ratio "${WARMUP_RATIO}" \
+  --weight-decay "${WEIGHT_DECAY}" \
+  --label-smoothing "${LABEL_SMOOTHING}" \
+  --lr-schedule "${LR_SCHEDULE}" \
+  --early-stop-patience "${PATIENCE}" \
+  --eval-every-steps "${EVAL_EVERY}" \
+  --log-every-steps 100 \
+  --num-workers 4 \
+  --amp bf16 \
+  --seed 42 \
+  --device cuda \
+  "${DROPOUT_ARG[@]}" 2>&1
+
+echo "[INFO] End=$(date)"

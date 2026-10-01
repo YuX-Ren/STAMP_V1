@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N zenc_zc30k
+#PBS -l walltime=01:30:00
+#PBS -l select=1:ncpus=16:mem=32gb
+#PBS -J 0-42
+
+# Single-view STAMP encoding of ZINC15 shards 0..42 (=101M rows, > 100M cap).
+# One PBS array task per input shard. Non-ring-aware chembl-mined vocab (32k).
+
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+IDX=${PBS_ARRAY_INDEX:-0}
+IDX_ZP=$(printf "%05d" "${IDX}")
+IN_PARQUET=/scratch/yuxuan.ren/data/l1_zinc_smiles/train_${IDX_ZP}-of-00178.parquet
+OUT_DIR=/scratch/yuxuan.ren/data/zinc_curated30k_stamp
+OUT_PARQUET=${OUT_DIR}/train_${IDX_ZP}-of-00178_stamp.parquet
+VOCAB=/scratch/yuxuan.ren/data/ckpt_stamp/zinc_curated_vocab_30k_legacy/motif_vocab.txt
+
+if [[ ! -f "${IN_PARQUET}" ]]; then
+  echo "[ERROR] input parquet not found: ${IN_PARQUET}"
+  exit 2
+fi
+if [[ ! -f "${VOCAB}" ]]; then
+  echo "[ERROR] vocab not found: ${VOCAB}"
+  exit 2
+fi
+
+export TOKENIZERS_PARALLELISM=false
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) IDX=${IDX} Start=$(date)"
+echo "[INFO] IN=${IN_PARQUET}"
+echo "[INFO] OUT=${OUT_PARQUET}"
+
+python scripts/benchmark/encode_zinc_shard_singleview.py \
+  --in-parquet "${IN_PARQUET}" \
+  --out-parquet "${OUT_PARQUET}" \
+  --stamp-vocab "${VOCAB}" \
+  --smiles-col smiles \
+  --n-workers 16 \
+  --batch-size 20000 2>&1
+
+echo "[INFO] End=$(date)"

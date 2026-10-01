@@ -1,0 +1,37 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N dl_c4_molt5
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${OUT_DIR:=/scratch/yuxuan.ren/data/c4}"
+: "${HF_DATASET:=allenai/c4}"
+: "${INCLUDE_TRAIN:=en/c4-train.*.json.gz}"
+: "${INCLUDE_VALID:=en/c4-validation.*.json.gz}"
+
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] Downloading ${HF_DATASET} to ${OUT_DIR}"
+echo "[INFO] INCLUDE_TRAIN=${INCLUDE_TRAIN}"
+echo "[INFO] INCLUDE_VALID=${INCLUDE_VALID}"
+
+hf download "${HF_DATASET}" \
+  --repo-type dataset \
+  --include "${INCLUDE_TRAIN}" \
+  --include "${INCLUDE_VALID}" \
+  --local-dir "${OUT_DIR}"
+
+echo "[INFO] End=$(date)"

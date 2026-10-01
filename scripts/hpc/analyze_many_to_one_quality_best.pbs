@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N many_to_one_eval
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=120gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${NUM_SAMPLES:=2048}"
+: "${BATCH_SIZE:=256}"
+: "${TEMPERATURE:=0.7}"
+: "${TOP_K:=0}"
+: "${TOP_P:=0.95}"
+: "${MAX_NEW:=127}"
+
+AOGPT_DIR=/scratch/yuxuan.ren/data/ckpt_stamp/aogpt_l1l3_10m_20260519_184923/legacy_tree
+LLAMA_DIR=/scratch/yuxuan.ren/data/ckpt_stamp/llama_l1_l3_full_ddp4_20260519_161054/legacy_tree
+AOGPT_CKPT="${AOGPT_DIR}/checkpoints/$(cat "${AOGPT_DIR}/checkpoints/best_quality_checkpoint.txt")"
+LLAMA_CKPT="${LLAMA_DIR}/checkpoints/$(cat "${LLAMA_DIR}/checkpoints/best_quality_checkpoint.txt")"
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+cd "${REPO_ROOT}"
+
+echo "[many-to-one] host=$(hostname) start=$(date)"
+echo "[many-to-one] AO-GPT checkpoint=${AOGPT_CKPT}"
+echo "[many-to-one] Llama checkpoint=${LLAMA_CKPT}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+
+python -u scripts/benchmark/analyze_generation_many_to_one.py \
+  --checkpoint "${AOGPT_CKPT}" \
+  --model-dir "${AOGPT_DIR}" \
+  --output "${AOGPT_DIR}/many_to_one_best_n${NUM_SAMPLES}.json" \
+  --num-samples "${NUM_SAMPLES}" \
+  --batch-size "${BATCH_SIZE}" \
+  --temperature "${TEMPERATURE}" \
+  --top-k "${TOP_K}" \
+  --top-p "${TOP_P}" \
+  --max-new "${MAX_NEW}" \
+  --device cuda
+
+python -u scripts/benchmark/analyze_generation_many_to_one.py \
+  --checkpoint "${LLAMA_CKPT}" \
+  --model-dir "${LLAMA_DIR}" \
+  --output "${LLAMA_DIR}/many_to_one_best_n${NUM_SAMPLES}.json" \
+  --num-samples "${NUM_SAMPLES}" \
+  --batch-size "${BATCH_SIZE}" \
+  --temperature "${TEMPERATURE}" \
+  --top-k "${TOP_K}" \
+  --top-p "${TOP_P}" \
+  --max-new "${MAX_NEW}" \
+  --device cuda
+
+echo "[many-to-one] done $(date)"

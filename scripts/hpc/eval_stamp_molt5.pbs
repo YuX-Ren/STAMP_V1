@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_molt5
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=96gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${CKPT:=/scratch/yuxuan.ren/data/ckpt_stamp/stamp_molt5_l3_full_top12k_base_4g_fixvocab_20260620/model.pt}"
+: "${OUT_DIR:=/nfs/home/svu/yuxuan.ren/STAMP_V1.5/results/stamp_molt5_eval_final_20260621}"
+: "${VALID_PARQUET:=/scratch/yuxuan.ren/data/zinc_l3_full_condition/val_*_stamp.parquet}"
+: "${NUM_EXAMPLES:=1024}"
+: "${BATCH_SIZE:=32}"
+: "${NUM_BEAMS:=1}"
+
+export OMP_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] CKPT=${CKPT}"
+echo "[INFO] OUT_DIR=${OUT_DIR}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+
+python -u scripts/benchmark/eval_stamp_molt5.py \
+  --checkpoint "${CKPT}" \
+  --valid-parquet "${VALID_PARQUET}" \
+  --output-dir "${OUT_DIR}" \
+  --num-examples "${NUM_EXAMPLES}" \
+  --batch-size "${BATCH_SIZE}" \
+  --num-beams "${NUM_BEAMS}" \
+  --device cuda 2>&1 | tee "${OUT_DIR}/eval.log"
+
+echo "[INFO] End=$(date)"

@@ -1,0 +1,63 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N rebuild_stamp
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=24:mem=96gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${MANIFEST:=/nfs/home/svu/yuxuan.ren/STAMP_V1.5/data/manifests/zinc_l3_full_raw_nonstrict_salts_20260621.tsv}"
+: "${STAMP_VOCAB:=/nfs/home/svu/yuxuan.ren/STAMP_V1.5/data/vocab_merged/motif_vocab.txt}"
+: "${N_WORKERS:=20}"
+: "${BATCH_SIZE:=10000}"
+: "${OVERWRITE:=0}"
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+
+IDX="${PBS_ARRAY_INDEX:-0}"
+LINE="$(sed -n "$((IDX + 1))p" "${MANIFEST}")"
+if [[ -z "${LINE}" ]]; then
+  echo "[ERROR] No manifest line for PBS_ARRAY_INDEX=${IDX}"
+  exit 2
+fi
+
+IFS=$'\t' read -r INPUT OUTPUT ADD_SPLIT <<< "${LINE}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] IDX=${IDX}"
+echo "[INFO] INPUT=${INPUT}"
+echo "[INFO] OUTPUT=${OUTPUT}"
+echo "[INFO] ADD_SPLIT=${ADD_SPLIT}"
+echo "[INFO] STAMP_VOCAB=${STAMP_VOCAB}"
+python -V
+
+ARGS=()
+if [[ "${ADD_SPLIT}" == "1" ]]; then
+  ARGS+=(--add-split-random --val-fraction 0.05)
+fi
+if [[ "${OVERWRITE}" == "1" ]]; then
+  ARGS+=(--overwrite)
+fi
+
+python -u scripts/benchmark/rebuild_stamp_parquet.py \
+  --input "${INPUT}" \
+  --output "${OUTPUT}" \
+  --stamp-vocab "${STAMP_VOCAB}" \
+  --repo-root "${REPO_ROOT}" \
+  --n-workers "${N_WORKERS}" \
+  --batch-size "${BATCH_SIZE}" \
+  "${ARGS[@]}"
+
+echo "[INFO] End=$(date)"

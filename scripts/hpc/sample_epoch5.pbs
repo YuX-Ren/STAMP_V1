@@ -1,0 +1,8 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N ao_sample_ep5
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=64gb
+bash /home/svu/yuxuan.ren/STAMP_V1.5/scripts/hpc/sample_epoch5.sh

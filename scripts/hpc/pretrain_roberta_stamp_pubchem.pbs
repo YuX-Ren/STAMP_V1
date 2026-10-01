@@ -1,0 +1,115 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_robpt_pc10m
+#PBS -l walltime=72:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=96gb
+
+set -euo pipefail
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+cd /home/svu/yuxuan.ren/STAMP_V1.5
+
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+which python; python --version; nvidia-smi || true
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+
+# ---- Inputs ----
+TRAIN="${TRAIN:-/scratch/yuxuan.ren/data/pubchem10m/splits/train.smi}"
+VALID="${VALID:-/scratch/yuxuan.ren/data/pubchem10m/splits/valid.smi}"
+
+# ---- Output root ----
+RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/pretrain_sweep}"
+
+# ---- Vocab variants to sweep ----
+# Pass space-separated list of "tag=path" pairs, e.g.:
+#   VARIANTS="v500=/path/v500/vocab.txt v2000=/path/v2000/vocab.txt"
+# When unset, defaults will be filled in after task #5 (cutoff decision) is finalized.
+: "${VARIANTS:?Set VARIANTS=\"tag1=path1 tag2=path2 ...\" via qsub -v VARIANTS=...}"
+
+# ---- RoBERTa architecture (ChemBERTa-2 small defaults) ----
+D_MODEL=768
+N_HEADS=12
+N_LAYERS=6
+D_FF=1536
+MAX_SEQ_LEN=512
+MASK_PROB=0.15
+
+# ---- Pretrain knobs ----
+PT_BATCH_SIZE="${PT_BATCH_SIZE:-256}"
+PT_LR="${PT_LR:-5e-4}"
+PT_EPOCHS="${PT_EPOCHS:-10}"
+ENCODE_WORKERS="${ENCODE_WORKERS:-16}"
+ENCODE_CHUNKSIZE="${ENCODE_CHUNKSIZE:-256}"
+NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+
+mkdir -p "${RUN_ROOT}"
+echo "============================================"
+echo "RUN_ROOT     ${RUN_ROOT}"
+echo "TRAIN        ${TRAIN}"
+echo "VALID        ${VALID}"
+echo "VARIANTS     ${VARIANTS}"
+echo "PT_BATCH     ${PT_BATCH_SIZE}"
+echo "PT_LR        ${PT_LR}"
+echo "PT_EPOCHS    ${PT_EPOCHS}"
+echo "============================================"
+
+for entry in ${VARIANTS}; do
+  tag="${entry%%=*}"
+  vocab="${entry#*=}"
+  if [ ! -f "${vocab}" ]; then
+    echo "[ERROR] vocab file missing for ${tag}: ${vocab}"
+    continue
+  fi
+  out="${RUN_ROOT}/${tag}"
+  if [ -f "${out}/pretrained_roberta.pt" ]; then
+    echo "[SKIP] ${tag} already trained: ${out}/pretrained_roberta.pt"
+    continue
+  fi
+
+  echo
+  echo "========== Pretrain ${tag} =========="
+  echo "vocab:  ${vocab}"
+  echo "out:    ${out}"
+  echo "Start:  $(date)"
+
+  time python scripts/experiments_cli.py pretrain-roberta \
+    --train "${TRAIN}" \
+    --valid "${VALID}" \
+    --representation stamp \
+    --stamp-vocab "${vocab}" \
+    --output-dir "${out}" \
+    --d-model ${D_MODEL} \
+    --n-heads ${N_HEADS} \
+    --n-layers ${N_LAYERS} \
+    --d-ff ${D_FF} \
+    --max-seq-len ${MAX_SEQ_LEN} \
+    --mask-prob ${MASK_PROB} \
+    --batch-size ${PT_BATCH_SIZE} \
+    --lr ${PT_LR} \
+    --pretrain-epochs ${PT_EPOCHS} \
+    --encode-workers "${ENCODE_WORKERS}" \
+    --encode-chunksize "${ENCODE_CHUNKSIZE}" \
+    --num-data-workers "${NUM_DATA_WORKERS}" \
+    --prefetch-factor 4 \
+    --amp auto \
+    --device cuda \
+    2>&1 | tee "${out}/pretrain.log" || {
+      echo "[FAIL] ${tag} pretrain"
+      continue
+    }
+
+  echo "[DONE] ${tag} at $(date)"
+done
+
+echo
+echo "============================================"
+echo "All pretrain variants done at $(date)"
+echo "============================================"

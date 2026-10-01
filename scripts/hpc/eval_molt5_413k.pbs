@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molt5_eval_413k
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=48gb
+
+# One-shot C4+ZINC valid_loss for the MolT5 mixed pretrain at step 413000.
+# The run that produced this ckpt died at step 413001 on a corrupt ZINC parquet
+# page, so its 10k-boundary eval only reached step 410000. This job appends
+# the missing 413000 datapoint to eval_history.json.
+
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+RUN_DIR=/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/ckpt/molt5_c4_zinc100m_stamp_top12k_bs512_t5v11base_4g_20260623_171854
+CKPT_DIR=${RUN_DIR}/checkpoints/step_00413000
+
+# shard_00000_msring.parquet is confirmed clean; the crash-shard is somewhere
+# later in the glob. Pinning valid to this file guarantees no OSError repeats.
+ZINC_VALID_PARQUET=/scratch/yuxuan.ren/data/molformer_encoded_msring/zinc15/shard_00000_msring.parquet
+
+export TOKENIZERS_PARALLELISM=false
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] RUN_DIR=${RUN_DIR}"
+echo "[INFO] CKPT_DIR=${CKPT_DIR}"
+echo "[INFO] ZINC_VALID_PARQUET=${ZINC_VALID_PARQUET}"
+
+python scripts/benchmark/eval_molt5_ckpt.py \
+  --ckpt-dir "${CKPT_DIR}" \
+  --output-dir "${RUN_DIR}" \
+  --zinc-valid-parquet "${ZINC_VALID_PARQUET}" \
+  --num-data-workers 2 \
+  --device cuda 2>&1
+
+echo "[INFO] End=$(date)"

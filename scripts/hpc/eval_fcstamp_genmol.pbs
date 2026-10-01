@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_fcstamp
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=120gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${MODEL_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/fcstamp_finetune_200k_aogpt_top12k_1g/legacy_tree}"
+: "${TASK_PARQUET:=data/genmol_fcstamp_infill.parquet}"
+: "${OUTPUT_DIR:=${MODEL_DIR}/eval_fcstamp_genmol}"
+: "${NUM_SAMPLES:=100}"
+: "${BATCH_SIZE:=100}"
+: "${TEMPERATURE:=0.8}"
+: "${TOP_K:=0}"
+: "${TOP_P:=0.95}"
+: "${DIVERSE_PREFIX_PENALTY:=0.0}"
+: "${TASK_SAMPLING_JSON:=}"
+: "${MAX_NEW:=64}"
+: "${SEED:=20260525}"
+: "${STRIP_STEREO:=0}"
+: "${SEQUENTIAL_HOLES:=0}"
+: "${AGGREGATE_ATTACH_SITES:=0}"
+: "${SAMPLES_PER_ATTACH_SITE:=0}"
+
+if [[ "${STRIP_STEREO}" == "0" || "${STRIP_STEREO}" == "false" || "${STRIP_STEREO}" == "False" ]]; then
+  STEREO_ARG=(--no-strip-stereo)
+else
+  STEREO_ARG=(--strip-stereo)
+fi
+if [[ "${SEQUENTIAL_HOLES}" == "0" || "${SEQUENTIAL_HOLES}" == "false" || "${SEQUENTIAL_HOLES}" == "False" ]]; then
+  SEQUENTIAL_ARG=(--no-sequential-holes)
+else
+  SEQUENTIAL_ARG=(--sequential-holes)
+fi
+if [[ "${AGGREGATE_ATTACH_SITES}" == "0" || "${AGGREGATE_ATTACH_SITES}" == "false" || "${AGGREGATE_ATTACH_SITES}" == "False" ]]; then
+  AGGREGATE_ATTACH_ARG=(--no-aggregate-attach-sites)
+else
+  AGGREGATE_ATTACH_ARG=(--aggregate-attach-sites)
+fi
+
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+echo "[INFO] Activate conda env=${CONDA_ENV} $(date)"
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUTPUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] MODEL_DIR=${MODEL_DIR}"
+echo "[INFO] TASK_PARQUET=${TASK_PARQUET}"
+echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+python -V
+
+python -u scripts/benchmark/eval_fcstamp_genmol.py \
+  --model-dir "${MODEL_DIR}" \
+  --task-parquet "${TASK_PARQUET}" \
+  --output-dir "${OUTPUT_DIR}" \
+  --num-samples "${NUM_SAMPLES}" \
+  --batch-size "${BATCH_SIZE}" \
+  --temperature "${TEMPERATURE}" \
+  --top-k "${TOP_K}" \
+  --top-p "${TOP_P}" \
+  --diverse-prefix-penalty "${DIVERSE_PREFIX_PENALTY}" \
+  --task-sampling-json "${TASK_SAMPLING_JSON}" \
+  --max-new "${MAX_NEW}" \
+  --seed "${SEED}" \
+  "${STEREO_ARG[@]}" \
+  "${SEQUENTIAL_ARG[@]}" \
+  "${AGGREGATE_ATTACH_ARG[@]}" \
+  --samples-per-attach-site "${SAMPLES_PER_ATTACH_SITE}" \
+  --device cuda
+
+echo "[INFO] End=$(date)"

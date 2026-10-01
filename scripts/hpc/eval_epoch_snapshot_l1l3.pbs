@@ -1,0 +1,89 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_l1l3_ep
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=48gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${MODEL_SRC:=/scratch/yuxuan.ren/data/ckpt_stamp/llama_l1l3_10m_quality_20260518_181406/legacy_tree}"
+: "${CHECKPOINT:=${MODEL_SRC}/checkpoints/epoch_0002.pt}"
+: "${EPOCH_TAG:=epoch_0002}"
+: "${SNAPSHOT_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/eval_snapshots/l1l3_10m_${EPOCH_TAG}_$(date +%Y%m%d_%H%M%S)}"
+: "${OUT_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/llama_l1l3_10m_quality_20260518_181406/eval_${EPOCH_TAG}_t07_p095_n500}"
+: "${NUM_SAMPLES:=500}"
+: "${TEMP:=0.7}"
+: "${TOPK:=0}"
+: "${TOPP:=0.95}"
+: "${DEDUP_FILL:=1}"
+: "${OVERSAMPLE_FACTOR:=3.0}"
+
+export OMP_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+
+mkdir -p "${SNAPSHOT_DIR}" "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+echo "[INFO] MODEL_SRC=${MODEL_SRC}"
+echo "[INFO] CHECKPOINT=${CHECKPOINT}"
+echo "[INFO] SNAPSHOT_DIR=${SNAPSHOT_DIR}"
+echo "[INFO] OUT_DIR=${OUT_DIR}"
+echo "[INFO] NUM_SAMPLES=${NUM_SAMPLES} TEMP=${TEMP} TOPK=${TOPK} TOPP=${TOPP}"
+echo "[INFO] DEDUP_FILL=${DEDUP_FILL} OVERSAMPLE_FACTOR=${OVERSAMPLE_FACTOR}"
+
+cp "${CHECKPOINT}" "${SNAPSHOT_DIR}/model.pt"
+cp "${MODEL_SRC}/stamp_vocab.txt" "${SNAPSHOT_DIR}/stamp_vocab.txt"
+
+MODEL_SRC_ENV="${MODEL_SRC}" SNAPSHOT_DIR_ENV="${SNAPSHOT_DIR}" python -c '
+import json
+import os
+from pathlib import Path
+import torch
+
+model_src = Path(os.environ["MODEL_SRC_ENV"])
+snapshot_dir = Path(os.environ["SNAPSHOT_DIR_ENV"])
+payload = torch.load(model_src / "_scan_cache.pt", map_location="cpu")
+(snapshot_dir / "vocab.json").write_text(
+    json.dumps(payload["vocab"], ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+print(json.dumps({
+    "snapshot_dir": str(snapshot_dir),
+    "vocab_type": payload.get("vocab_type"),
+    "vocab_size": len(payload.get("vocab", {}).get("itos", [])),
+    "train_rows": payload.get("summary", {}).get("train_rows"),
+    "valid_rows_sampled": payload.get("summary", {}).get("valid_rows_sampled"),
+}, indent=2))
+'
+
+DEDUP_ARGS=()
+if [[ "${DEDUP_FILL}" == "1" ]]; then
+  DEDUP_ARGS=(--dedup-fill --oversample-factor "${OVERSAMPLE_FACTOR}")
+fi
+
+python -u scripts/benchmark/eval_denovo_taskaware.py \
+  --model-dir "${SNAPSHOT_DIR}" \
+  --output-dir "${OUT_DIR}" \
+  --num-samples "${NUM_SAMPLES}" \
+  --batch-size 200 \
+  --temperature "${TEMP}" \
+  --top-k "${TOPK}" \
+  --top-p "${TOPP}" \
+  --max-new 80 \
+  --device cuda \
+  --seed 0 \
+  "${DEDUP_ARGS[@]}" 2>&1 | tee "${OUT_DIR}/eval.log"
+
+echo "[INFO] Eval JSON: ${OUT_DIR}/denovo_eval.json"
+cat "${OUT_DIR}/denovo_eval.json"
+echo "[INFO] End=$(date)"

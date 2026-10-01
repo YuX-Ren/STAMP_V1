@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molt5_eval_chebi20
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ngpus=1:ncpus=12:mem=48gb
+
+# Evaluate finetuned MolT5 ChEBI-20 model on test split.
+# DIRECTION={mol2text,text2mol}
+#   qsub -v DIRECTION=mol2text scripts/hpc/eval_molt5_chebi20.pbs
+#   qsub -v DIRECTION=text2mol scripts/hpc/eval_molt5_chebi20.pbs
+
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+DIRECTION=${DIRECTION:-mol2text}
+CKPT_DIR=${CKPT_DIR:-/scratch/Projects/CFP-03/CFP03-CF-130/yuxuan.ren/ckpt/molt5_chebi20_${DIRECTION}_zc30k/best}
+TEST_PARQUET=${TEST_PARQUET:-/scratch/yuxuan.ren/data/chebi20/finetune_zinc_curated30k/test.parquet}
+OUT_DIR=${OUT_DIR:-${CKPT_DIR}/../eval_test}
+NUM_BEAMS=${NUM_BEAMS:-5}
+BATCH_SIZE=${BATCH_SIZE:-32}
+MAX_NEW=${MAX_NEW:-256}
+LIMIT=${LIMIT:-0}
+
+export TOKENIZERS_PARALLELISM=false
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] DIRECTION=${DIRECTION}"
+echo "[INFO] CKPT_DIR=${CKPT_DIR}"
+echo "[INFO] TEST_PARQUET=${TEST_PARQUET}"
+echo "[INFO] OUT_DIR=${OUT_DIR}"
+
+python scripts/benchmark/eval_molt5_chebi20.py \
+  --ckpt-dir "${CKPT_DIR}" \
+  --test-parquet "${TEST_PARQUET}" \
+  --direction "${DIRECTION}" \
+  --output-dir "${OUT_DIR}" \
+  --max-source-len 256 \
+  --max-new-tokens "${MAX_NEW}" \
+  --num-beams "${NUM_BEAMS}" \
+  --batch-size "${BATCH_SIZE}" \
+  --limit "${LIMIT}" \
+  --device cuda 2>&1
+
+echo "[INFO] End=$(date)"

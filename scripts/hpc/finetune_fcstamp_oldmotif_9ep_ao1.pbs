@@ -1,0 +1,97 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N fcft_oldmot9
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=250gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${FINETUNE_PARQUET:=/scratch/yuxuan.ren/data/fcstamp_old_motif_extension_333k.parquet}"
+: "${STAMP_VOCAB:=/scratch/yuxuan.ren/zinc_pretrain/vocab_merged/motif_vocab.txt}"
+: "${MOTIF_FREQ_FILE:=/scratch/yuxuan.ren/zinc_pretrain/vocab_merged/zinc_plus_augment_full_freq.txt}"
+: "${INIT_FROM:=/scratch/yuxuan.ren/data/ckpt_stamp/zinc_l3_full_aogpt_uncond_top12k_4g/legacy_tree/checkpoints/step_00300000.pt}"
+: "${RUN_NAME:=fcstamp_task_motif_extension_old333k_aogpt_top12k_1g_len256_ep9}"
+: "${OUTPUT_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/${RUN_NAME}}"
+
+: "${EPOCHS:=9}"
+: "${BATCH_SIZE:=256}"
+: "${GLOBAL_BATCH_SIZE:=256}"
+: "${MAX_SEQ_LEN:=256}"
+: "${LR:=1e-4}"
+: "${VALID_MAX_ROWS:=4000}"
+: "${SAVE_EVERY_STEPS:=500}"
+: "${KEEP_LAST_STEP_CKPTS:=4}"
+
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=WARN
+
+echo "[INFO] Activate conda env=${CONDA_ENV} $(date)"
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUTPUT_DIR}/logs"
+LOG_FILE="${OUTPUT_DIR}/logs/train_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] FINETUNE_PARQUET=${FINETUNE_PARQUET}"
+echo "[INFO] INIT_FROM=${INIT_FROM}"
+echo "[INFO] STAMP_VOCAB=${STAMP_VOCAB}"
+echo "[INFO] MOTIF_FREQ_FILE=${MOTIF_FREQ_FILE}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+python -V
+
+python -u scripts/benchmark/train_ao_gpt_parquet.py \
+  --parquet "${FINETUNE_PARQUET}" \
+  --stamp-vocab "${STAMP_VOCAB}" \
+  --output-dir "${OUTPUT_DIR}" \
+  --text-column stamp_smiles \
+  --label-start-column label_start \
+  --smiles-column source_smiles \
+  --split-column split_random \
+  --train-split train \
+  --valid-split val \
+  --include-failures \
+  --model-type ao_gpt \
+  --init-from "${INIT_FROM}" \
+  --motif-fallback \
+  --freq-cutoff 5000 \
+  --max-atomic-motifs 12000 \
+  --motif-frequency-file "${MOTIF_FREQ_FILE}" \
+  --fallback-p-low 0.02 \
+  --fallback-p-high 0.15 \
+  --epochs "${EPOCHS}" \
+  --valid-max-rows "${VALID_MAX_ROWS}" \
+  --train-max-rows 0 \
+  --d-model 768 \
+  --n-heads 12 \
+  --n-layers 12 \
+  --d-ff 3072 \
+  --batch-size "${BATCH_SIZE}" \
+  --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+  --dropout 0.1 \
+  --max-seq-len "${MAX_SEQ_LEN}" \
+  --lr "${LR}" \
+  --weight-decay 0.1 \
+  --amp bf16 \
+  --num-data-workers 4 \
+  --prefetch-factor 6 \
+  --no-torch-compile \
+  --save-every-steps "${SAVE_EVERY_STEPS}" \
+  --keep-last-step-checkpoints "${KEEP_LAST_STEP_CKPTS}" \
+  --checkpoint-top-k-by-quality 0 \
+  --save-latest-model \
+  --no-save-every-epoch \
+  --no-tqdm 2>&1 | tee "${LOG_FILE}"
+
+echo "[INFO] End=$(date)"
+echo "[INFO] Log: ${LOG_FILE}"

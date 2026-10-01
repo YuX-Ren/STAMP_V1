@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N mot_infill
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=80gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${MODEL_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/zinc_l3_full_aogpt_uncond_top12k_4g/legacy_tree}"
+: "${STAMP_PARQUET:=/scratch/yuxuan.ren/data/zinc_l3_full_raw/train_00010-of-00178_stamp.parquet}"
+: "${OUT_DIR:=${MODEL_DIR}/motif_slot_infill_smoke_20260604}"
+: "${NUM_EXAMPLES:=32}"
+: "${MAX_SCAN_ROWS:=2000}"
+: "${TOP_K:=10}"
+: "${SEED:=17}"
+: "${CASES_JSON:=}"
+
+export OMP_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] MODEL_DIR=${MODEL_DIR}"
+echo "[INFO] STAMP_PARQUET=${STAMP_PARQUET}"
+echo "[INFO] OUT_DIR=${OUT_DIR}"
+echo "[INFO] NUM_EXAMPLES=${NUM_EXAMPLES} MAX_SCAN_ROWS=${MAX_SCAN_ROWS} TOP_K=${TOP_K} SEED=${SEED}"
+echo "[INFO] CASES_JSON=${CASES_JSON}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+
+CASE_ARGS=()
+if [[ -n "${CASES_JSON}" ]]; then
+  CASE_ARGS=(--cases-json "${CASES_JSON}")
+fi
+
+for ORDER_MODE in trainlike fullctx; do
+  echo "[INFO] Running ORDER_MODE=${ORDER_MODE}"
+  python -u scripts/benchmark/eval_motif_slot_infill.py \
+    --model-dir "${MODEL_DIR}" \
+    --stamp-parquet "${STAMP_PARQUET}" \
+    --output-dir "${OUT_DIR}" \
+    --num-examples "${NUM_EXAMPLES}" \
+    --max-scan-rows "${MAX_SCAN_ROWS}" \
+    --top-k "${TOP_K}" \
+    --seed "${SEED}" \
+    --device cuda \
+    --order-mode "${ORDER_MODE}" \
+    "${CASE_ARGS[@]}"
+done
+
+echo "[INFO] End=$(date)"

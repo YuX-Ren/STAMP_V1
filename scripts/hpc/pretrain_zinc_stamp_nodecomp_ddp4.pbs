@@ -1,0 +1,141 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N zinc_stamp_nodecomp_4g
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=4:ncpus=48:mem=900gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+
+: "${STAMP_PARQUET:=/Project_Storage/CFP-03/CFP03-CF-130/data/zinc_pretrain/output/*_stamp.parquet}"
+: "${STAMP_VOCAB:=/Project_Storage/CFP-03/CFP03-CF-130/data/zinc_pretrain/vocab_merged/motif_vocab.txt}"
+: "${TEXT_COLUMN:=stamp}"
+: "${SMILES_COLUMN:=smiles}"
+: "${SPLIT_COLUMN:=}"
+: "${RUN_NAME:=zinc_stamp_nodecomp_${MODEL_TYPE:-llama}_ddp4_$(date +%Y%m%d_%H%M%S)}"
+: "${OUTPUT_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/${RUN_NAME}}"
+: "${RESUME_FROM:=}"
+
+: "${MODEL_TYPE:=llama}"
+: "${MOTIF_FALLBACK:=1}"
+: "${FREQ_CUTOFF:=5000}"
+: "${MAX_ATOMIC_MOTIFS:=12000}"
+: "${MOTIF_FREQ_FILE:=/Project_Storage/CFP-03/CFP03-CF-130/data/zinc_pretrain/vocab_merged/zinc_plus_augment_full_freq.txt}"
+: "${FALLBACK_P_LOW:=0.02}"
+: "${FALLBACK_P_HIGH:=0.15}"
+: "${TRAIN_MAX_ROWS:=0}"
+: "${CONDITION_MODE:=none}"
+: "${CONDITION_COLUMN:=}"
+: "${QUALITY_CONDITION_TOKENS:=}"
+: "${NPROC_PER_NODE:=4}"
+: "${BATCH_SIZE:=256}"
+: "${GLOBAL_BATCH_SIZE:=1024}"
+: "${EPOCHS:=1}"
+: "${VALID_MAX_ROWS:=20000}"
+: "${MAX_SEQ_LEN:=256}"
+: "${SAVE_EVERY_STEPS:=10000}"
+: "${KEEP_LAST_STEP_CKPTS:=0}"
+: "${CHECKPOINT_TOP_K_BY_QUALITY:=10}"
+: "${QUALITY_EVAL_SAMPLES:=1024}"
+: "${QUALITY_EVAL_BATCH_SIZE:=128}"
+: "${QUALITY_EVAL_TEMPERATURE:=0.7}"
+: "${QUALITY_EVAL_TOP_K:=0}"
+: "${QUALITY_EVAL_TOP_P:=0.95}"
+: "${QUALITY_EVAL_MAX_NEW:=0}"
+
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=WARN
+
+echo "[INFO] Activate conda env=${CONDA_ENV} $(date)"
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+cd "${REPO_ROOT}"
+mkdir -p "${OUTPUT_DIR}/logs"
+LOG_FILE="${OUTPUT_DIR}/logs/train_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] Host=$(hostname) Start=$(date)"
+echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] STAMP_PARQUET=${STAMP_PARQUET}"
+echo "[INFO] STAMP_VOCAB=${STAMP_VOCAB}"
+echo "[INFO] TEXT_COLUMN=${TEXT_COLUMN} SMILES_COLUMN=${SMILES_COLUMN} SPLIT_COLUMN=${SPLIT_COLUMN}"
+echo "[INFO] MODEL_TYPE=${MODEL_TYPE} TRAIN_MAX_ROWS=${TRAIN_MAX_ROWS} EPOCHS=${EPOCHS} MAX_SEQ_LEN=${MAX_SEQ_LEN}"
+echo "[INFO] CONDITION_MODE=${CONDITION_MODE} CONDITION_COLUMN=${CONDITION_COLUMN} QUALITY_CONDITION_TOKENS=${QUALITY_CONDITION_TOKENS}"
+echo "[INFO] NPROC_PER_NODE=${NPROC_PER_NODE} BATCH_SIZE=${BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
+echo "[INFO] MOTIF_FALLBACK=${MOTIF_FALLBACK} FREQ_CUTOFF=${FREQ_CUTOFF} MAX_ATOMIC_MOTIFS=${MAX_ATOMIC_MOTIFS} MOTIF_FREQ_FILE=${MOTIF_FREQ_FILE}"
+echo "[INFO] SAVE_EVERY_STEPS=${SAVE_EVERY_STEPS} CHECKPOINT_TOP_K_BY_QUALITY=${CHECKPOINT_TOP_K_BY_QUALITY}"
+echo "[INFO] RESUME_FROM=${RESUME_FROM}"
+nvidia-smi --query-gpu=name,memory.free --format=csv,noheader || true
+python -V
+
+TRAIN_TOKENIZER_ARGS=()
+if [[ "${MOTIF_FALLBACK}" == "1" ]]; then
+  TRAIN_TOKENIZER_ARGS=(
+    --motif-fallback
+    --freq-cutoff "${FREQ_CUTOFF}"
+    --max-atomic-motifs "${MAX_ATOMIC_MOTIFS}"
+    --motif-frequency-file "${MOTIF_FREQ_FILE}"
+    --fallback-p-low "${FALLBACK_P_LOW}"
+    --fallback-p-high "${FALLBACK_P_HIGH}"
+  )
+fi
+
+RESUME_ARGS=()
+if [[ -n "${RESUME_FROM}" ]]; then
+  RESUME_ARGS=(
+    --resume-from "${RESUME_FROM}"
+    --reuse-scan-cache
+  )
+fi
+
+if [[ "${MODEL_TYPE}" == "llama" ]]; then
+  MODEL_ARGS=(--d-model 1024 --n-heads 16 --n-layers 12 --d-ff 4096 --batch-size "${BATCH_SIZE}" --global-batch-size "${GLOBAL_BATCH_SIZE}")
+else
+  MODEL_ARGS=(--d-model 768 --n-heads 12 --n-layers 12 --d-ff 3072 --batch-size "${BATCH_SIZE}" --global-batch-size "${GLOBAL_BATCH_SIZE}")
+fi
+
+echo "[INFO] Launch torchrun $(date)"
+torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/benchmark/train_ao_gpt_parquet.py \
+  --parquet "${STAMP_PARQUET}" \
+  --stamp-vocab "${STAMP_VOCAB}" \
+  --output-dir "${OUTPUT_DIR}" \
+  --text-column "${TEXT_COLUMN}" --smiles-column "${SMILES_COLUMN}" --split-column "${SPLIT_COLUMN}" \
+  --train-split train --valid-split val \
+  --include-failures \
+  --model-type "${MODEL_TYPE}" \
+  --condition-mode "${CONDITION_MODE}" \
+  --condition-column "${CONDITION_COLUMN}" \
+  --quality-condition-tokens "${QUALITY_CONDITION_TOKENS}" \
+  "${TRAIN_TOKENIZER_ARGS[@]}" \
+  --epochs "${EPOCHS}" \
+  --valid-max-rows "${VALID_MAX_ROWS}" \
+  --train-max-rows "${TRAIN_MAX_ROWS}" \
+  "${MODEL_ARGS[@]}" \
+  --dropout 0.1 --max-seq-len "${MAX_SEQ_LEN}" \
+  --lr 3e-4 --weight-decay 0.1 --amp bf16 \
+  --num-data-workers 4 --prefetch-factor 6 \
+  --no-torch-compile \
+  --save-every-steps "${SAVE_EVERY_STEPS}" \
+  --keep-last-step-checkpoints "${KEEP_LAST_STEP_CKPTS}" \
+  --checkpoint-top-k-by-quality "${CHECKPOINT_TOP_K_BY_QUALITY}" \
+  --quality-eval-samples "${QUALITY_EVAL_SAMPLES}" \
+  --quality-eval-batch-size "${QUALITY_EVAL_BATCH_SIZE}" \
+  --quality-eval-temperature "${QUALITY_EVAL_TEMPERATURE}" \
+  --quality-eval-top-k "${QUALITY_EVAL_TOP_K}" \
+  --quality-eval-top-p "${QUALITY_EVAL_TOP_P}" \
+  --quality-eval-max-new "${QUALITY_EVAL_MAX_NEW}" \
+  --no-save-latest-model \
+  --no-save-every-epoch \
+  "${RESUME_ARGS[@]}" \
+  --no-tqdm 2>&1 | tee "${LOG_FILE}"
+
+echo "[INFO] End=$(date)"
+echo "[INFO] Log: ${LOG_FILE}"
