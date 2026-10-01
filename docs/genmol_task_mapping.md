@@ -129,7 +129,7 @@
 
 当前映射脚本：
 
-- [scripts/benchmark/eval_ao_genmol_fragments.py](/playpen-shared/mufan/github/ethanR/STAMP/scripts/benchmark/eval_ao_genmol_fragments.py)
+- [`scripts/benchmark/eval_ao_genmol_fragments.py`](../scripts/benchmark/eval_ao_genmol_fragments.py)
 
 映射核心逻辑：
 
@@ -318,4 +318,3 @@ GenMol 原始数据里没有单独的 `scaffold_morphing` 列。
 - 当前 STAMP 映射里，`motif_extension / scaffold_decoration / superstructure_generation` 基本是对的；
 - `linker_design` 语义接近，但采样机制还不是原始 SAFE 版本；
 - `scaffold_morphing` 不是 GenMol 原始数据列，而是我们额外扩展出来的任务。
-

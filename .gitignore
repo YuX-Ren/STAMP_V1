@@ -1,13 +1,57 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv*/
+venv/
+
+# Editor and coding-agent state
+.idea/
+.vscode/
+.claude/
+.codex
+.agents/
+claude_resume*
+
+# Datasets, generated outputs, and model artifacts
+data/
 results/
-test/
+output/
+outputs/
+logs/
+stamp_v2/
 *.csv
 *.smiles
-output/
-.codex
-*.pyc
+*.smi
+*.parquet
+*.arrow
+*.pkl
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.safetensors
 *.pdf
-claude_resume
-data/
-logs/
-stamp_v2
-tests
+
+# Scheduler and run logs
+*.o[0-9]*
+*.e[0-9]*
+*.out
+*.err
+*.log
+
+# Local deployment copies and separately managed dependencies
+isolated/
+oracle/
+third_party/
+paper_edit_geometry_*/
+
+# OS metadata
+.DS_Store
+Thumbs.db
