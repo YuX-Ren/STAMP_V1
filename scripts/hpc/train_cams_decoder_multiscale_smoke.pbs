@@ -1,0 +1,36 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N cams_ms_smoke
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=128gb
+
+set -euo pipefail
+
+cd /nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+
+export DATA_DIR="${DATA_DIR:-/scratch/yuxuan.ren/zinc_pretrain/output_multiscale_smoke}"
+export VOCAB_DIR="${VOCAB_DIR:-/scratch/yuxuan.ren/zinc_pretrain/vocab_merged}"
+export OUT_DIR="${OUT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_multiscale_zinc_smoke}"
+
+export TRAIN_GLOB="${TRAIN_GLOB:-${DATA_DIR}/train_*_ms.parquet}"
+export VALID_GLOB="${VALID_GLOB:-${DATA_DIR}/val_*_ms.parquet}"
+export TEXT_COLUMN="${TEXT_COLUMN:-stamp}"
+
+export BATCH_SIZE="${BATCH_SIZE:-4}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+export MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+export EPOCHS="${EPOCHS:-1}"
+export TRAIN_MAX_ROWS="${TRAIN_MAX_ROWS:-1024}"
+export VALID_MAX_ROWS="${VALID_MAX_ROWS:-256}"
+export SCAN_TRAIN_MAX_ROWS="${SCAN_TRAIN_MAX_ROWS:-1024}"
+export SCAN_VALID_MAX_ROWS="${SCAN_VALID_MAX_ROWS:-256}"
+export NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+export PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+export TRAIN_VIEW_MODE="${TRAIN_VIEW_MODE:-cams_multiview}"
+export VALID_VIEW_MODE="${VALID_VIEW_MODE:-concat_only}"
+export WARMUP_STEPS="${WARMUP_STEPS:-500}"
+export DEVICE="${DEVICE:-cuda:0}"
+
+bash scripts/hpc/train_cams_decoder_multiscale_project.sh

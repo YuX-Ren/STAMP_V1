@@ -1,0 +1,105 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N cams_ft_mn
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=160gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_msring_3s_pubchem_zinc15_smilesfb/ring_single_edges}"
+DATA_DIR="${DATA_DIR:-/scratch/yuxuan.ren/data/moleculenet}"
+OUT_BASE="${OUT_BASE:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_msring_3s_pubchem_zinc15_smilesfb_moleculenet_ft}"
+
+TASK_GROUP="${TASK_GROUP:-all}"
+case "${TASK_GROUP}" in
+  small_cls)
+    DEFAULT_TASKS="bbbp bace clintox sider"
+    ;;
+  large_cls)
+    DEFAULT_TASKS="hiv tox21"
+    ;;
+  reg)
+    DEFAULT_TASKS="esol freesolv lipophilicity"
+    ;;
+  all)
+    DEFAULT_TASKS="bbbp hiv bace clintox tox21 sider esol freesolv lipophilicity"
+    ;;
+  *)
+    DEFAULT_TASKS="${TASK_GROUP}"
+    ;;
+esac
+
+TASKS="${TASKS:-${DEFAULT_TASKS}}"
+EPOCHS="${EPOCHS:-80}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+LR="${LR:-2e-5}"
+PATIENCE="${PATIENCE:-12}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}"
+FP_MODE="${FP_MODE:-late_fusion}"
+RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-${OUT_BASE}/${TASK_GROUP}/${RUN_ID}}"
+OUT_JSON="${OUT_JSON:-${OUT_DIR}/results.json}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+
+if [ ! -d "${CHECKPOINT_DIR}" ]; then
+  echo "ERROR: missing checkpoint dir: ${CHECKPOINT_DIR}" >&2
+  exit 2
+fi
+if [ ! -d "${DATA_DIR}" ]; then
+  echo "ERROR: missing MoleculeNet data dir: ${DATA_DIR}" >&2
+  exit 2
+fi
+
+if [ -z "${CHECKPOINT_FILE:-}" ]; then
+  CHECKPOINT_FILE="$(ls -1t "${CHECKPOINT_DIR}"/checkpoints/step_*.pt | head -n 1)"
+fi
+if [ ! -f "${CHECKPOINT_FILE}" ]; then
+  echo "ERROR: missing checkpoint file: ${CHECKPOINT_FILE}" >&2
+  exit 2
+fi
+
+mkdir -p "${OUT_DIR}/logs"
+LOG_FILE="${OUT_DIR}/logs/finetune_${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${RUN_ID}"
+echo "[INFO] checkpoint_dir=${CHECKPOINT_DIR}"
+echo "[INFO] checkpoint_file=${CHECKPOINT_FILE}"
+echo "[INFO] data=${DATA_DIR}"
+echo "[INFO] tasks=${TASKS}"
+echo "[INFO] out=${OUT_JSON}"
+echo "[INFO] epochs=${EPOCHS} batch_size=${BATCH_SIZE} lr=${LR} patience=${PATIENCE} max_seq_len=${MAX_SEQ_LEN} fp_mode=${FP_MODE}"
+nvidia-smi || true
+
+python scripts/benchmark/finetune_cams_decoder_pp.py \
+  --checkpoint-dir "${CHECKPOINT_DIR}" \
+  --checkpoint-file "${CHECKPOINT_FILE}" \
+  --data-dir "${DATA_DIR}" \
+  --output "${OUT_JSON}" \
+  --tasks ${TASKS} \
+  --epochs "${EPOCHS}" \
+  --lr "${LR}" \
+  --batch-size "${BATCH_SIZE}" \
+  --max-seq-len "${MAX_SEQ_LEN}" \
+  --dropout 0.1 \
+  --patience "${PATIENCE}" \
+  --fp-mode "${FP_MODE}" \
+  --force-ring-aware-encode \
+  --device cuda \
+  2>&1 | tee -a "${LOG_FILE}"

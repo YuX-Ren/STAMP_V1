@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N tune_rob_srp53
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=1:ncpus=12:mem=96gb
+
+set -u
+
+export REPO_ROOT="${REPO_ROOT:-/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp}"
+export PRETRAIN_DIR="${PRETRAIN_DIR:-/scratch/yuxuan.ren/data/pubchem10m/pretrain_stamp_top4666_mtr}"
+export DATA_DIR="${DATA_DIR:-/scratch/yuxuan.ren/data/moleculenet}"
+export RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/tune_stamp_roberta_mtr_tox21_srp53_wmask_$(date +%Y%m%d_%H%M%S)}"
+
+# Single-target SR-p53. DeepChem w masks are now applied in roberta_property.py.
+export MULTITASK_CLASSIFICATION=0
+export LR_GRID="${LR_GRID:-1e-6 3e-6 1e-5 3e-5}"
+export DROPOUT_GRID="${DROPOUT_GRID:-0 0.05 0.1 0.2}"
+export WD_GRID="${WD_GRID:-0 1e-6 1e-4}"
+export TRAIN_SEEDS="${TRAIN_SEEDS:-42}"
+export SPLIT_SEED="${SPLIT_SEED:-42}"
+export FT_EPOCHS="${FT_EPOCHS:-30}"
+export FT_BATCH_SIZE="${FT_BATCH_SIZE:-64}"
+export ENCODE_WORKERS="${ENCODE_WORKERS:-8}"
+export ENCODE_CHUNKSIZE="${ENCODE_CHUNKSIZE:-128}"
+export NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+export PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+export AMP="${AMP:-auto}"
+
+bash "${REPO_ROOT}/scripts/hpc/tune_roberta_stamp_mtr_tox21.pbs"

@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N diag_super_arom
+#PBS -l walltime=00:45:00
+#PBS -l select=1:ngpus=1:ncpus=4:mem=32gb
+
+set -u
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+
+echo "===== diag_super.py (superstructure containment with aromatize fix) ====="
+python /home/svu/yuxuan.ren/diag_super.py
+
+echo
+echo "===== eval_stamp_native_fragtasks.py (all 4 tasks, 10 targets) ====="
+python /home/svu/yuxuan.ren/eval_stamp_native_fragtasks.py

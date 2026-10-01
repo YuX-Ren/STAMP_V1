@@ -1,0 +1,109 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N cams_ms_full
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ngpus=4:ncpus=48:mem=512gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+DATA_DIR="${DATA_DIR:-/scratch/yuxuan.ren/zinc_pretrain/output_multiscale_full}"
+VOCAB_DIR="${VOCAB_DIR:-/scratch/yuxuan.ren/zinc_pretrain/vocab_merged}"
+OUT_DIR="${OUT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_multiscale_3s_zinc_full}"
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-256}"
+EPOCHS="${EPOCHS:-1}"
+MAX_OPTIMIZER_STEPS="${MAX_OPTIMIZER_STEPS:-50000}"
+SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-1000}"
+LENGTH_BUCKET_SIZE="${LENGTH_BUCKET_SIZE:-8}"
+VALID_MAX_ROWS="${VALID_MAX_ROWS:-20000}"
+SCAN_TRAIN_MAX_ROWS="${SCAN_TRAIN_MAX_ROWS:-200000}"
+SCAN_VALID_MAX_ROWS="${SCAN_VALID_MAX_ROWS:-20000}"
+NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+AMP="${AMP:-fp16}"
+DEVICE="${DEVICE:-cuda}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+
+if [ ! -d "${DATA_DIR}" ]; then
+  echo "ERROR: DATA_DIR missing: ${DATA_DIR}" >&2
+  exit 2
+fi
+if [ ! -f "${VOCAB_DIR}/motif_vocab.txt" ]; then
+  echo "ERROR: vocab missing: ${VOCAB_DIR}/motif_vocab.txt" >&2
+  exit 2
+fi
+
+mkdir -p "${OUT_DIR}/logs"
+LOG_FILE="${OUT_DIR}/logs/train_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${PBS_JOBID:-manual}"
+echo "[INFO] data=${DATA_DIR}"
+echo "[INFO] vocab=${VOCAB_DIR}"
+echo "[INFO] out=${OUT_DIR}"
+echo "[INFO] nproc=${NPROC_PER_NODE} batch_per_rank=${BATCH_SIZE} global_batch=${GLOBAL_BATCH_SIZE} max_seq_len=${MAX_SEQ_LEN}"
+nvidia-smi || true
+
+torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/benchmark/train_cams_decoder_shards.py \
+  --train-glob "${DATA_DIR}/train_*_ms.parquet" \
+  --valid-glob "${DATA_DIR}/val_*_ms.parquet" \
+  --stamp-vocab "${VOCAB_DIR}/motif_vocab.txt" \
+  --output-dir "${OUT_DIR}" \
+  --text-column stamp \
+  --multiscale-vocabs "${VOCAB_DIR}/motif_vocab_top1k.txt,${VOCAB_DIR}/motif_vocab_top4k.txt,${VOCAB_DIR}/motif_vocab_top12k.txt" \
+  --multiscale-scale-names top1k,top4k,top12k \
+  --train-view-mode cams_multiview \
+  --valid-view-mode concat_only \
+  --expected-single-scale-views 3 \
+  --loss-skip-special-tokens \
+  --backbone llama \
+  --d-model 720 \
+  --n-heads 8 \
+  --n-layers 16 \
+  --d-ff 2880 \
+  --dropout 0.0 \
+  --max-seq-len "${MAX_SEQ_LEN}" \
+  --batch-size "${BATCH_SIZE}" \
+  --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+  --lr 3e-4 \
+  --min-lr 0.0 \
+  --weight-decay 0.01 \
+  --lr-scheduler cosine \
+  --warmup-steps 5000 \
+  --epochs "${EPOCHS}" \
+  --max-optimizer-steps "${MAX_OPTIMIZER_STEPS}" \
+  --train-max-rows 0 \
+  --length-bucket-size "${LENGTH_BUCKET_SIZE}" \
+  --valid-max-rows "${VALID_MAX_ROWS}" \
+  --scan-train-max-rows "${SCAN_TRAIN_MAX_ROWS}" \
+  --scan-valid-max-rows "${SCAN_VALID_MAX_ROWS}" \
+  --seed 42 \
+  --num-data-workers "${NUM_DATA_WORKERS}" \
+  --prefetch-factor "${PREFETCH_FACTOR}" \
+  --amp "${AMP}" \
+  --device "${DEVICE}" \
+  --no-torch-compile \
+  --save-every-steps "${SAVE_EVERY_STEPS}" \
+  --reuse-scan-cache \
+  2>&1 | tee -a "${LOG_FILE}"

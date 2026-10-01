@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_mf_tox21
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=1:ncpus=12:mem=96gb
+
+set -euo pipefail
+
+export REPO_ROOT="${REPO_ROOT:-/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp}"
+export MOLFORMER_ZIP="${MOLFORMER_ZIP:-/scratch/yuxuan.ren/data/molformer_original/downloads/finetune_datasets.zip}"
+export MOLFORMER_SPLITS_ROOT="${MOLFORMER_SPLITS_ROOT:-/scratch/yuxuan.ren/data/molformer_original/finetune_datasets}"
+
+mkdir -p "${MOLFORMER_SPLITS_ROOT}"
+if [ ! -f "${MOLFORMER_SPLITS_ROOT}/data/tox21/train.csv" ] || \
+   [ ! -f "${MOLFORMER_SPLITS_ROOT}/data/tox21/valid.csv" ] || \
+   [ ! -f "${MOLFORMER_SPLITS_ROOT}/data/tox21/test.csv" ]; then
+  unzip -q -o "${MOLFORMER_ZIP}" \
+    data/tox21/train.csv \
+    data/tox21/valid.csv \
+    data/tox21/test.csv \
+    -d "${MOLFORMER_SPLITS_ROOT}"
+fi
+
+export PRETRAIN_ROOT="${PRETRAIN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m}"
+export RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/finetune_stamp_top4666_mtr_tox21_molformer_split_highlr_$(date +%Y%m%d_%H%M%S)}"
+export DATA_DIR="${MOLFORMER_SPLITS_ROOT}/data/tox21"
+export VARIANTS="${VARIANTS:-pretrain_stamp_top4666_mtr}"
+export TASKS="${TASKS:-tox21}"
+
+export FT_LR="${FT_LR:-3e-5}"
+export FT_DROPOUT="${FT_DROPOUT:-0}"
+export FT_BATCH_SIZE="${FT_BATCH_SIZE:-64}"
+export FT_EPOCHS="${FT_EPOCHS:-30}"
+export TRAIN_SEED="${TRAIN_SEED:-42}"
+export SPLIT_SEED="${SPLIT_SEED:-42}"
+export ENCODE_WORKERS="${ENCODE_WORKERS:-8}"
+export ENCODE_CHUNKSIZE="${ENCODE_CHUNKSIZE:-128}"
+export NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+export PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+export AMP="${AMP:-auto}"
+
+bash "${REPO_ROOT}/scripts/hpc/finetune_roberta_stamp_pubchem10m_repro.pbs"

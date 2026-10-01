@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_mine_vocab_pc
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=32:mem=96gb
+
+set -euo pipefail
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+cd /home/svu/yuxuan.ren/STAMP_V1.5
+
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+which python
+python --version
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+
+# ---- Inputs / outputs ----
+INPUT="${INPUT:-/scratch/yuxuan.ren/data/pubchem10m/splits/vocab_mining_5M.smi}"
+OUT_DIR="${OUT_DIR:-/scratch/yuxuan.ren/data/pubchem10m/vocab_psvae_ring_v10000}"
+OUT_VOCAB="${OUT_DIR}/vocab.txt"
+
+# ---- Mining knobs ----
+VOCAB_SIZE="${VOCAB_SIZE:-10000}"           # large target; later sliced to smaller cutoffs via slice_psvae_vocab.py
+MAX_MINING_MOLS="${MAX_MINING_MOLS:-1000000}" # subsample 1M from the 5M file (decision: option b)
+WORKERS="${WORKERS:-32}"
+RING_BLESSED_FREQ="${RING_BLESSED_FREQ:-1000}"  # rings present in ≥1000 mols of 1M = ≥0.1% are pre-merged whole
+
+mkdir -p "${OUT_DIR}"
+
+echo "=========================================="
+echo "INPUT             ${INPUT}"
+echo "OUT_DIR           ${OUT_DIR}"
+echo "VOCAB_SIZE        ${VOCAB_SIZE}"
+echo "MAX_MINING_MOLS   ${MAX_MINING_MOLS}"
+echo "WORKERS           ${WORKERS}"
+echo "RING_BLESSED_FREQ ${RING_BLESSED_FREQ}"
+echo "=========================================="
+
+time python scripts/experiments_cli.py mine-vocab-ring \
+  --input "${INPUT}" \
+  --output "${OUT_VOCAB}" \
+  --vocab-size "${VOCAB_SIZE}" \
+  --max-mining-mols "${MAX_MINING_MOLS}" \
+  --workers "${WORKERS}" \
+  --ring-blessed-freq "${RING_BLESSED_FREQ}" \
+  2>&1 | tee "${OUT_DIR}/mine.log"
+
+echo
+echo "===== mining done at $(date) ====="
+ls -lh "${OUT_DIR}"
+echo
+echo "Top-20 motifs by recorded freq:"
+head -2 "${OUT_VOCAB}"
+sed -n '2,21p' "${OUT_VOCAB}"
+echo "..."
+echo "Tail-5 motifs:"
+tail -5 "${OUT_VOCAB}"
+echo
+echo "Total lines (incl header):"
+wc -l "${OUT_VOCAB}"

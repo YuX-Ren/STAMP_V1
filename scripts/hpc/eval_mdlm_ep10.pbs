@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_mdlm_ep10
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=4:mem=32gb
+
+# Evaluate MDLM ep10 checkpoint (GenMol-aligned metric).
+# Override via qsub -v CKPT_PATH=...,N=...,STEPS=...,TEMPERATURE=...,TOP_K=...
+
+set -u
+: "${RUN_DIR:=/scratch/yuxuan.ren/data/ckpt_stamp/stamp_mdlm_30m_d512_l8_e3}"
+: "${CKPT_PATH:=${RUN_DIR}/checkpoints/epoch_0010/model.pt}"
+: "${N:=1024}"
+: "${MAX_NEW:=64}"
+: "${STEPS:=128}"
+: "${TEMPERATURE:=1.0}"
+: "${TOP_K:=50}"
+: "${TAG:=epoch_0010}"
+
+export RUN_DIR CKPT_PATH N MAX_NEW STEPS TEMPERATURE TOP_K TAG
+bash /home/svu/yuxuan.ren/STAMP_V1.5/scripts/hpc/eval_mdlm_ep1.sh

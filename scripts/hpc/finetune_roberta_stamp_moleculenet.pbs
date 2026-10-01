@@ -1,0 +1,131 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N stamp_robft_mn
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ngpus=1:ncpus=8:mem=64gb
+
+set -euo pipefail
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+cd /home/svu/yuxuan.ren/STAMP_V1.5
+
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+which python; python --version; nvidia-smi || true
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+
+# ---- Pretrain root from task #6 ----
+PRETRAIN_ROOT="${PRETRAIN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/pretrain_sweep}"
+
+# ---- Output root ----
+RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/finetune_sweep}"
+
+# ---- Variants to sweep (must match task #6 tags) ----
+: "${VARIANTS:?Set VARIANTS=\"tag1 tag2 ...\" via qsub -v VARIANTS=...}"
+
+# ---- MoleculeNet task list (ChemBERTa-2 paper set) ----
+TASKS="${TASKS:-bbbp hiv bace tox21 clintox sider esol freesolv lipophilicity}"
+
+# ---- Fine-tune knobs (paper defaults) ----
+FT_BATCH_SIZE="${FT_BATCH_SIZE:-32}"
+FT_LR="${FT_LR:-2e-5}"
+FT_EPOCHS="${FT_EPOCHS:-20}"
+FT_DROPOUT="${FT_DROPOUT:-0.1}"
+ENCODE_WORKERS="${ENCODE_WORKERS:-8}"
+ENCODE_CHUNKSIZE="${ENCODE_CHUNKSIZE:-128}"
+NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+SEED="${SEED:-42}"
+
+mkdir -p "${RUN_ROOT}"
+echo "============================================"
+echo "PRETRAIN_ROOT  ${PRETRAIN_ROOT}"
+echo "RUN_ROOT       ${RUN_ROOT}"
+echo "VARIANTS       ${VARIANTS}"
+echo "TASKS          ${TASKS}"
+echo "FT_BATCH       ${FT_BATCH_SIZE}"
+echo "FT_LR          ${FT_LR}"
+echo "FT_EPOCHS      ${FT_EPOCHS}"
+echo "============================================"
+
+for tag in ${VARIANTS}; do
+  pt_dir="${PRETRAIN_ROOT}/${tag}"
+  if [ ! -f "${pt_dir}/pretrained_roberta.pt" ]; then
+    echo "[SKIP] no pretrained model for ${tag}"
+    continue
+  fi
+  for task in ${TASKS}; do
+    out_dir="${RUN_ROOT}/${tag}/${task}"
+    if [ -f "${out_dir}/finetune_results.json" ]; then
+      echo "[SKIP] ${tag}/${task} already done"
+      continue
+    fi
+    echo
+    echo "========== ${tag} / ${task} =========="
+    echo "Start: $(date)"
+
+    time python scripts/experiments_cli.py finetune-roberta \
+      --pretrained-dir "${pt_dir}" \
+      --task "${task}" \
+      --output-dir "${out_dir}" \
+      --finetune-epochs ${FT_EPOCHS} \
+      --finetune-lr ${FT_LR} \
+      --finetune-batch-size ${FT_BATCH_SIZE} \
+      --dropout ${FT_DROPOUT} \
+      --encode-workers "${ENCODE_WORKERS}" \
+      --encode-chunksize "${ENCODE_CHUNKSIZE}" \
+      --num-data-workers "${NUM_DATA_WORKERS}" \
+      --prefetch-factor 4 \
+      --amp auto \
+      --device cuda \
+      --seed ${SEED} \
+      2>&1 | tee "${out_dir}/finetune.log" || {
+        echo "[FAIL] ${tag}/${task}"
+        continue
+      }
+    echo "[DONE] ${tag}/${task} at $(date)"
+  done
+done
+
+# ---- Aggregate ----
+echo
+echo "===== Building summary CSV ====="
+python - <<PY
+import json, csv
+from pathlib import Path
+root = Path("${RUN_ROOT}")
+variants = "${VARIANTS}".split()
+tasks = "${TASKS}".split()
+rows = []
+for v in variants:
+    row = {"variant": v}
+    for t in tasks:
+        p = root / v / t / "finetune_results.json"
+        if p.exists():
+            d = json.loads(p.read_text())
+            row[f"{t}"] = d.get("test_roc_auc", d.get("test_rmse", "NA"))
+        else:
+            row[f"{t}"] = "MISSING"
+    rows.append(row)
+fields = ["variant"] + tasks
+out = root / "summary.csv"
+with out.open("w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+print(f"Saved {out}")
+for r in rows:
+    print(r)
+PY
+
+echo
+echo "============================================"
+echo "All fine-tune variants done at $(date)"
+echo "============================================"

@@ -1,0 +1,155 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N tune_rob_tox21
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=1:ncpus=12:mem=96gb
+
+set -u
+
+REPO_ROOT="${REPO_ROOT:-/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp}"
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+PRETRAIN_DIR="${PRETRAIN_DIR:-/scratch/yuxuan.ren/data/pubchem10m/pretrain_stamp_top4666_mtr}"
+DATA_DIR="${DATA_DIR:-/scratch/yuxuan.ren/data/moleculenet}"
+RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/tune_stamp_roberta_mtr_tox21_$(date +%Y%m%d_%H%M%S)}"
+
+LR_GRID="${LR_GRID:-1e-6 3e-6 1e-5 3e-5}"
+DROPOUT_GRID="${DROPOUT_GRID:-0 0.05 0.1 0.2}"
+WD_GRID="${WD_GRID:-0 1e-6 1e-4}"
+TRAIN_SEEDS="${TRAIN_SEEDS:-42}"
+SPLIT_SEED="${SPLIT_SEED:-42}"
+
+FT_EPOCHS="${FT_EPOCHS:-30}"
+FT_BATCH_SIZE="${FT_BATCH_SIZE:-64}"
+ENCODE_WORKERS="${ENCODE_WORKERS:-8}"
+ENCODE_CHUNKSIZE="${ENCODE_CHUNKSIZE:-128}"
+NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+AMP="${AMP:-auto}"
+MULTITASK_CLASSIFICATION="${MULTITASK_CLASSIFICATION:-1}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM=false
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+mkdir -p "${RUN_ROOT}/logs"
+LOG_FILE="${RUN_ROOT}/logs/tune_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)" | tee -a "${LOG_FILE}"
+echo "[INFO] job=${PBS_JOBID:-manual}" | tee -a "${LOG_FILE}"
+echo "[INFO] repo=${REPO_ROOT}" | tee -a "${LOG_FILE}"
+echo "[INFO] pretrain_dir=${PRETRAIN_DIR}" | tee -a "${LOG_FILE}"
+echo "[INFO] data_dir=${DATA_DIR}" | tee -a "${LOG_FILE}"
+echo "[INFO] run_root=${RUN_ROOT}" | tee -a "${LOG_FILE}"
+echo "[INFO] lr_grid=${LR_GRID}" | tee -a "${LOG_FILE}"
+echo "[INFO] dropout_grid=${DROPOUT_GRID}" | tee -a "${LOG_FILE}"
+echo "[INFO] wd_grid=${WD_GRID}" | tee -a "${LOG_FILE}"
+echo "[INFO] seeds=${TRAIN_SEEDS} split_seed=${SPLIT_SEED}" | tee -a "${LOG_FILE}"
+echo "[INFO] epochs=${FT_EPOCHS} batch=${FT_BATCH_SIZE} multitask=${MULTITASK_CLASSIFICATION}" | tee -a "${LOG_FILE}"
+nvidia-smi | tee -a "${LOG_FILE}"
+
+if [ ! -f "${PRETRAIN_DIR}/pretrained_roberta.pt" ]; then
+  echo "[ERROR] missing ${PRETRAIN_DIR}/pretrained_roberta.pt" | tee -a "${LOG_FILE}"
+  exit 2
+fi
+
+for lr in ${LR_GRID}; do
+  for dropout in ${DROPOUT_GRID}; do
+    for wd in ${WD_GRID}; do
+      for seed in ${TRAIN_SEEDS}; do
+        tag="lr${lr}_do${dropout}_wd${wd}_seed${seed}"
+        tag="${tag//./p}"
+        tag="${tag//- /m}"
+        out_dir="${RUN_ROOT}/${tag}"
+        if [ -f "${out_dir}/finetune_results.json" ]; then
+          echo "[SKIP] ${tag}" | tee -a "${LOG_FILE}"
+          continue
+        fi
+        mkdir -p "${out_dir}"
+        echo "========== ${tag} start $(date) ==========" | tee -a "${LOG_FILE}"
+        cmd=(
+          python scripts/experiments_cli.py finetune-roberta
+          --pretrained-dir "${PRETRAIN_DIR}"
+          --task tox21
+          --data-dir "${DATA_DIR}"
+          --output-dir "${out_dir}"
+          --split-seed "${SPLIT_SEED}"
+          --train-seed "${seed}"
+          --finetune-epochs "${FT_EPOCHS}"
+          --finetune-lr "${lr}"
+          --finetune-batch-size "${FT_BATCH_SIZE}"
+          --dropout "${dropout}"
+          --weight-decay "${wd}"
+          --encode-workers "${ENCODE_WORKERS}"
+          --encode-chunksize "${ENCODE_CHUNKSIZE}"
+          --num-data-workers "${NUM_DATA_WORKERS}"
+          --prefetch-factor "${PREFETCH_FACTOR}"
+          --amp "${AMP}"
+          --device cuda
+          --no-tqdm
+        )
+        if [ "${MULTITASK_CLASSIFICATION}" = "1" ]; then
+          cmd+=(--multitask-classification)
+        fi
+        if "${cmd[@]}" > "${out_dir}/finetune.log" 2>&1; then
+          echo "[OK] ${tag}" | tee -a "${LOG_FILE}"
+        else
+          status=$?
+          echo "[FAIL] ${tag} exit=${status}" | tee -a "${LOG_FILE}"
+          tail -n 40 "${out_dir}/finetune.log" | tee -a "${LOG_FILE}"
+        fi
+        echo "========== ${tag} done $(date) ==========" | tee -a "${LOG_FILE}"
+      done
+    done
+  done
+done
+
+python - <<PY | tee -a "${LOG_FILE}"
+import csv
+import json
+import math
+from pathlib import Path
+
+root = Path("${RUN_ROOT}")
+rows = []
+for p in sorted(root.glob("*/finetune_results.json")):
+    d = json.loads(p.read_text())
+    rows.append({
+        "run": p.parent.name,
+        "best_valid_roc_auc": d.get("best_valid_roc_auc", float("nan")),
+        "test_roc_auc": d.get("test_roc_auc", float("nan")),
+        "best_epoch": d.get("best_epoch", ""),
+        "n_tasks": d.get("n_tasks", 1),
+        "multitask_classification": d.get("multitask_classification", False),
+    })
+
+def key(row):
+    v = row["best_valid_roc_auc"]
+    return -v if isinstance(v, (int, float)) and not math.isnan(v) else float("inf")
+
+rows.sort(key=key)
+out = root / "summary.csv"
+with out.open("w", newline="") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=["run", "best_valid_roc_auc", "test_roc_auc", "best_epoch", "n_tasks", "multitask_classification"],
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"[SUMMARY] wrote {out}")
+for row in rows[:10]:
+    print(row)
+PY
+
+echo "[INFO] finished $(date)" | tee -a "${LOG_FILE}"

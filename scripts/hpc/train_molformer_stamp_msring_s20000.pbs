@@ -1,0 +1,112 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molf_s20000_pre
+#PBS -l walltime=96:00:00
+#PBS -l select=1:ngpus=4:ncpus=48:mem=512gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+DATA_ROOT="${DATA_ROOT:-/scratch/yuxuan.ren/data/molformer_encoded_msring}"
+TRAIN_GLOB="${TRAIN_GLOB:-${DATA_ROOT}/pubchem/*.parquet,${DATA_ROOT}/zinc15/*.parquet}"
+STAMP_VOCAB="${STAMP_VOCAB:-${DATA_ROOT}/vocab/multiscale_ring_augmented/vocab_s20000_plus_atoms.txt}"
+OUT_DIR="${OUT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/molformer_stamp_msring_s20000_full}"
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}"
+LENGTH_BUCKET_SIZE="${LENGTH_BUCKET_SIZE:-16}"
+EPOCHS="${EPOCHS:-4}"
+MAX_STEPS="${MAX_STEPS:-0}"
+SCAN_MAX_ROWS="${SCAN_MAX_ROWS:-200000}"
+VALID_FILE_FRACTION="${VALID_FILE_FRACTION:-0.01}"
+VALID_MAX_ROWS="${VALID_MAX_ROWS:-200000}"
+EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-5000}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-10}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
+SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-5000}"
+NUM_DATA_WORKERS="${NUM_DATA_WORKERS:-12}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-8}"
+AMP="${AMP:-bf16}"
+MOTIF_SMILES_FALLBACK_PROB="${MOTIF_SMILES_FALLBACK_PROB:-0.10}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+
+if [ ! -f "${STAMP_VOCAB}" ]; then
+  echo "ERROR: vocab missing: ${STAMP_VOCAB}" >&2
+  exit 2
+fi
+
+mkdir -p "${OUT_DIR}/logs"
+LOG_FILE="${OUT_DIR}/logs/pretrain_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${PBS_JOBID:-manual}"
+echo "[INFO] train_glob=${TRAIN_GLOB}"
+echo "[INFO] vocab=${STAMP_VOCAB}"
+echo "[INFO] out=${OUT_DIR}"
+echo "[INFO] scale=s20000 view_index=2 motif_smiles_fallback_prob=${MOTIF_SMILES_FALLBACK_PROB}"
+echo "[INFO] nproc=${NPROC_PER_NODE} batch_per_rank=${BATCH_SIZE} global_batch=${GLOBAL_BATCH_SIZE} max_seq_len=${MAX_SEQ_LEN} length_bucket=${LENGTH_BUCKET_SIZE}"
+echo "[INFO] valid_file_fraction=${VALID_FILE_FRACTION} valid_max_rows=${VALID_MAX_ROWS} eval_every_steps=${EVAL_EVERY_STEPS} early_stop_patience=${EARLY_STOP_PATIENCE}"
+nvidia-smi || true
+
+torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/benchmark/train_molformer_stamp_shards.py \
+  --train-glob "${TRAIN_GLOB}" \
+  --text-column stamp \
+  --stamp-vocabs "${STAMP_VOCAB}" \
+  --output-dir "${OUT_DIR}" \
+  --view-mode concat_only \
+  --view-index 2 \
+  --include-smiles-vocab \
+  --fallback-oov-to-smiles \
+  --motif-smiles-fallback-prob "${MOTIF_SMILES_FALLBACK_PROB}" \
+  --max-seq-len "${MAX_SEQ_LEN}" \
+  --length-bucket-size "${LENGTH_BUCKET_SIZE}" \
+  --drop-overlength \
+  --scan-max-rows "${SCAN_MAX_ROWS}" \
+  --valid-file-fraction "${VALID_FILE_FRACTION}" \
+  --valid-max-rows "${VALID_MAX_ROWS}" \
+  --eval-every-steps "${EVAL_EVERY_STEPS}" \
+  --early-stop-patience "${EARLY_STOP_PATIENCE}" \
+  --early-stop-min-delta "${EARLY_STOP_MIN_DELTA}" \
+  --d-model 768 \
+  --n-heads 12 \
+  --n-layers 12 \
+  --d-ff 768 \
+  --dropout 0.2 \
+  --num-random-features 32 \
+  --batch-size "${BATCH_SIZE}" \
+  --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+  --epochs "${EPOCHS}" \
+  --max-steps "${MAX_STEPS}" \
+  --lr 2.4e-4 \
+  --min-lr 0.0 \
+  --warmup-steps 10000 \
+  --weight-decay 0.01 \
+  --optimizer lamb \
+  --mask-prob 0.15 \
+  --num-data-workers "${NUM_DATA_WORKERS}" \
+  --prefetch-factor "${PREFETCH_FACTOR}" \
+  --amp "${AMP}" \
+  --device cuda \
+  --seed 42 \
+  --save-every-steps "${SAVE_EVERY_STEPS}" \
+  --log-every 50 \
+  2>&1 | tee -a "${LOG_FILE}"

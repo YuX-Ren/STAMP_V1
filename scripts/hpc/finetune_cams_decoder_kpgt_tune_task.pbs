@@ -1,0 +1,136 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N cams_ft_tune
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=180gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_msring_3s_pubchem_zinc15_smilesfb/ring_single_edges}"
+CHECKPOINT_FILE="${CHECKPOINT_FILE:-${CHECKPOINT_DIR}/checkpoints/step_00050000.pt}"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/kpgt/datasets}"
+OUT_BASE="${OUT_BASE:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_msring_3s_pubchem_zinc15_smilesfb_kpgt_tuned_step50k}"
+
+TASK="${TASK:-bbbp}"
+SPLITS="${SPLITS:-scaffold-0 scaffold-1 scaffold-2}"
+LRS="${LRS:-1e-6 3e-6 1e-5 3e-5}"
+DROPOUTS="${DROPOUTS:-0 0.05 0.1 0.2}"
+WEIGHT_DECAYS="${WEIGHT_DECAYS:-0 1e-6 1e-4}"
+FP_MODES="${FP_MODES:-fp_token}"
+FP_BITS="${FP_BITS:-2048}"
+BATCH_SIZES="${BATCH_SIZES:-32}"
+STRATEGIES="${STRATEGIES:-normal}"
+LLRD_DECAYS="${LLRD_DECAYS:-0.95 0.9 0.85 0.8}"
+L2SP_WEIGHTS="${L2SP_WEIGHTS:-1e-1 1e-2 1e-3 1e-4}"
+FLAG_STEP_SIZES="${FLAG_STEP_SIZES:-1e-3 3e-3 5e-3 1e-2}"
+FLAG_M="${FLAG_M:-3}"
+REINIT_LAYERS="${REINIT_LAYERS:-1 2 3 4}"
+
+EPOCHS="${EPOCHS:-50}"
+PATIENCE="${PATIENCE:-20}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
+LR_SCHEDULER="${LR_SCHEDULER:-polynomial}"
+END_LR="${END_LR:-1e-9}"
+DROP_LAST_TRAIN="${DROP_LAST_TRAIN:-1}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-5.0}"
+LOSS_NORMALIZATION="${LOSS_NORMALIZATION:-kpgt_mean}"
+SEED="${SEED:-42}"
+RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-${OUT_BASE}/${TASK}/${RUN_ID}}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+source "${CONDA_SH}"
+set +e
+conda activate "${CONDA_ENV}"
+ACTIVATE_RC=$?
+set -e
+if [ "${ACTIVATE_RC}" -ne 0 ]; then
+  echo "[WARN] conda activate returned ${ACTIVATE_RC}; retrying after clearing active env vars" >&2
+  unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL
+  conda activate "${CONDA_ENV}"
+fi
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+
+if [ ! -f "${CHECKPOINT_FILE}" ]; then
+  echo "ERROR: missing checkpoint file: ${CHECKPOINT_FILE}" >&2
+  exit 2
+fi
+if [ ! -d "${DATA_DIR}" ]; then
+  echo "ERROR: missing KPGT data dir: ${DATA_DIR}" >&2
+  exit 2
+fi
+
+mkdir -p "${OUT_DIR}/logs"
+LOG_FILE="${OUT_DIR}/logs/tune_${TASK}_${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${RUN_ID}"
+echo "[INFO] task=${TASK}"
+echo "[INFO] checkpoint_file=${CHECKPOINT_FILE}"
+echo "[INFO] data=${DATA_DIR}"
+echo "[INFO] splits=${SPLITS}"
+echo "[INFO] out_dir=${OUT_DIR}"
+echo "[INFO] lrs=${LRS} dropouts=${DROPOUTS} weight_decays=${WEIGHT_DECAYS} fp_modes=${FP_MODES} fp_bits=${FP_BITS} batch_sizes=${BATCH_SIZES}"
+echo "[INFO] strategies=${STRATEGIES} llrd_decays=${LLRD_DECAYS} l2sp_weights=${L2SP_WEIGHTS} flag_step_sizes=${FLAG_STEP_SIZES} flag_m=${FLAG_M} reinit_layers=${REINIT_LAYERS}"
+echo "[INFO] epochs=${EPOCHS} patience=${PATIENCE} max_seq_len=${MAX_SEQ_LEN} warmup_ratio=${WARMUP_RATIO} warmup_steps=${WARMUP_STEPS} lr_scheduler=${LR_SCHEDULER} end_lr=${END_LR} drop_last_train=${DROP_LAST_TRAIN} grad_clip_norm=${GRAD_CLIP_NORM} loss_normalization=${LOSS_NORMALIZATION} seed=${SEED}"
+nvidia-smi || true
+
+EXTRA_ARGS=()
+if [ "${DROP_LAST_TRAIN}" = "1" ] || [ "${DROP_LAST_TRAIN}" = "true" ] || [ "${DROP_LAST_TRAIN}" = "TRUE" ]; then
+  EXTRA_ARGS+=(--drop-last-train)
+fi
+
+python scripts/benchmark/tune_cams_decoder_pp_grid.py \
+  --checkpoint-dir "${CHECKPOINT_DIR}" \
+  --checkpoint-file "${CHECKPOINT_FILE}" \
+  --data-dir "${DATA_DIR}" \
+  --output-dir "${OUT_DIR}" \
+  --tasks "${TASK}" \
+  --splits ${SPLITS} \
+  --split-source kpgt \
+  --epochs "${EPOCHS}" \
+  --patience "${PATIENCE}" \
+  --max-seq-len "${MAX_SEQ_LEN}" \
+  --fp-bits "${FP_BITS}" \
+  --lrs ${LRS} \
+  --dropouts ${DROPOUTS} \
+  --weight-decays ${WEIGHT_DECAYS} \
+  --fp-modes ${FP_MODES} \
+  --batch-sizes ${BATCH_SIZES} \
+  --strategies ${STRATEGIES} \
+  --llrd-decays ${LLRD_DECAYS} \
+  --l2sp-weights ${L2SP_WEIGHTS} \
+  --flag-step-sizes ${FLAG_STEP_SIZES} \
+  --flag-m "${FLAG_M}" \
+  --reinit-layers ${REINIT_LAYERS} \
+  --warmup-ratio "${WARMUP_RATIO}" \
+  --warmup-steps "${WARMUP_STEPS}" \
+  --lr-scheduler "${LR_SCHEDULER}" \
+  --end-lr "${END_LR}" \
+  --grad-clip-norm "${GRAD_CLIP_NORM}" \
+  --loss-normalization "${LOSS_NORMALIZATION}" \
+  --force-ring-aware-encode \
+  --seed "${SEED}" \
+  --device cuda \
+  "${EXTRA_ARGS[@]}" \
+  2>&1 | tee -a "${LOG_FILE}"
+
+python scripts/benchmark/summarize_cams_tuning.py \
+  --root "${OUT_DIR}" \
+  --task "${TASK}" \
+  --output "${OUT_DIR}/tuning_summary.json" \
+  2>&1 | tee -a "${LOG_FILE}"

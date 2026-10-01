@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -N moleculeace_embed_fig
+#PBS -l select=1:ngpus=1:ncpus=12:mem=128gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -V
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp}"
+PY="${PY:-/scratch/yuxuan.ren/miniconda3/envs/stamp-train-rdkit-2025_09_4/bin/python}"
+CONDA_PREFIX_DIR="${CONDA_PREFIX_DIR:-/scratch/yuxuan.ren/miniconda3/envs/stamp-train-rdkit-2025_09_4}"
+TASK="${TASK:-CHEMBL204_Ki}"
+RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/moleculeace_embedding_figures_${TASK}_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S)}"
+PROJECT_SYNC_DIR="${PROJECT_SYNC_DIR:-/Project_Storage/CFP-03/CFP03-CF-130/data/pubchem10m/$(basename "$RUN_ROOT")}"
+
+export TOKENIZERS_PARALLELISM=false
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER:-user}}"
+export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-/tmp/numba-cache-${USER:-user}}"
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX_DIR}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "$REPO_DIR"
+mkdir -p "$RUN_ROOT"
+
+echo "[info] host=$(hostname)"
+echo "[info] job=${PBS_JOBID:-manual}"
+echo "[info] task=$TASK"
+echo "[info] run_root=$RUN_ROOT"
+echo "[info] project_sync_dir=$PROJECT_SYNC_DIR"
+nvidia-smi || true
+
+"$PY" scripts/benchmark/moleculeace_embedding_figures.py \
+  --task "$TASK" \
+  --chemberta-local-files-only \
+  --device cuda \
+  --batch-size "${BATCH_SIZE:-64}" \
+  --output-dir "$RUN_ROOT"
+
+if [ -n "$PROJECT_SYNC_DIR" ] && [ -d "$(dirname "$PROJECT_SYNC_DIR")" ]; then
+  echo "[sync] project storage"
+  mkdir -p "$PROJECT_SYNC_DIR"
+  rsync -a "$RUN_ROOT/" "$PROJECT_SYNC_DIR/"
+  echo "Synced outputs to $PROJECT_SYNC_DIR"
+else
+  echo "[warn] project storage parent is not visible on this node; skipped sync."
+fi
+
+echo "Saved outputs to $RUN_ROOT"

@@ -1,0 +1,159 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N ao_diag
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=64gb
+
+set -euo pipefail
+
+REPO_ROOT=/home/svu/yuxuan.ren/STAMP_V1.5
+CONDA_ENV=stamp-train-rdkit-2025_09_4
+PARQUET=/scratch/yuxuan.ren/data/dataset_stamp.parquet
+STAMP_VOCAB=/scratch/yuxuan.ren/data/v3_cm_union.txt
+SCAN_CACHE=/scratch/yuxuan.ren/data/ckpt_stamp/ao_gpt_30m_d512_l8/_scan_cache.pt
+
+export OMP_NUM_THREADS=4
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+source /scratch/yuxuan.ren/miniconda3/bin/activate "${CONDA_ENV}"
+cd "${REPO_ROOT}"
+
+nvidia-smi || true
+echo "[INFO] Host=$(hostname) Start=$(date)"
+
+# Run nvidia-smi sampler in background to capture GPU util during training loop
+nvidia-smi dmon -s umc -c 120 > /tmp/diag_nvsmi_$$.log 2>&1 &
+DMON_PID=$!
+
+python - <<'PY'
+import sys, time, math, json
+sys.path.insert(0, '.')
+import torch
+from pathlib import Path
+from torch.utils.data import DataLoader
+
+from stamp.benchmark.lm import (
+    LMConfig, TinyDecoderLM, TokenVocab, _compute_ao_gpt_loss,
+    build_dynamic_lm_collate_fn,
+)
+from scripts.benchmark.train_ao_gpt_parquet import _ParquetTokenPairDataset, _load_scan_cache
+
+dev = torch.device('cuda:0')
+print(f'[diag] torch={torch.__version__} dev={dev} name={torch.cuda.get_device_name(0)}')
+
+# Load vocab from the existing scan cache (fast, no parquet re-scan)
+scan_summary, vocab = _load_scan_cache(Path('/scratch/yuxuan.ren/data/ckpt_stamp/ao_gpt_30m_d512_l8'))
+print(f'[diag] vocab_size={len(vocab.itos)} train_rows={scan_summary.train_rows}')
+
+cfg = LMConfig(
+    model_type='ao_gpt', d_model=512, n_heads=8, n_layers=8, d_ff=2048,
+    dropout=0.1, max_seq_len=64, batch_size=4096, lr=5e-4, weight_decay=0.01,
+    epochs=1, seed=42, num_data_workers=8, prefetch_factor=6, amp='bf16',
+    torch_compile=False, tf32=True,
+)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+ds = _ParquetTokenPairDataset(
+    parquet_path='/scratch/yuxuan.ren/data/dataset_stamp.parquet',
+    vocab=vocab, text_column='stamp_smiles', split_column='split_random',
+    split_value='train', require_all_pass=True,
+    max_seq_len=cfg.max_seq_len, max_rows=None, seed=42,
+    rank=0, world_size=1,
+)
+ds.set_epoch(0)
+collate_fn = build_dynamic_lm_collate_fn(vocab.pad_id, pad_to_multiple_of=8)
+
+def make_loader(num_workers, prefetch):
+    return DataLoader(
+        ds, batch_size=cfg.batch_size, collate_fn=collate_fn,
+        pin_memory=True, num_workers=num_workers,
+        **({'prefetch_factor': prefetch, 'persistent_workers': True} if num_workers>0 else {}),
+    )
+
+model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg).to(dev)
+opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=True)
+n_params = sum(p.numel() for p in model.parameters())
+print(f'[diag] model params={n_params/1e6:.2f}M')
+
+def phase(name, n_batches, fn, warmup=2):
+    loader = make_loader(8, 6)
+    it = iter(loader)
+    # warmup
+    for _ in range(warmup):
+        batch = next(it)
+        fn(batch)
+    torch.cuda.synchronize()
+    t0 = time.time()
+    tokens = 0
+    for _ in range(n_batches):
+        batch = next(it)
+        fn(batch)
+        tokens += batch[0].numel()
+    torch.cuda.synchronize()
+    dt = time.time() - t0
+    print(f'[{name:20s}] {n_batches} batches in {dt:.2f}s  '
+          f'=> {n_batches/dt:.2f} it/s  {tokens/dt/1e6:.2f}M tok/s  '
+          f'(avg seq={batch[0].shape[1]})')
+    del loader
+
+def f_dataonly(batch):
+    x, y = batch
+    x = x.to(dev, non_blocking=True)
+    y = y.to(dev, non_blocking=True)
+    torch.cuda.synchronize()
+
+def f_forward(batch):
+    x, y = batch
+    x = x.to(dev, non_blocking=True); y = y.to(dev, non_blocking=True)
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        _ = model(x)
+    torch.cuda.synchronize()
+
+def f_forward_loss(batch):
+    x, y = batch
+    x = x.to(dev, non_blocking=True); y = y.to(dev, non_blocking=True)
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=0.9)
+    torch.cuda.synchronize()
+
+def f_full_step(batch):
+    x, y = batch
+    x = x.to(dev, non_blocking=True); y = y.to(dev, non_blocking=True)
+    opt.zero_grad(set_to_none=True)
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=0.9)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    torch.cuda.synchronize()
+
+phase('data_only',      n_batches=30, fn=f_dataonly)
+phase('forward_only',   n_batches=30, fn=f_forward)
+phase('forward_loss',   n_batches=30, fn=f_forward_loss)
+phase('full_step',      n_batches=30, fn=f_full_step)
+
+# Probe IO-only throughput with more workers
+print('---- varying num_workers (full_step) ----')
+for nw in (4, 8, 12, 16):
+    loader = make_loader(nw, 6)
+    it = iter(loader); [next(it) for _ in range(2)]  # warmup
+    torch.cuda.synchronize(); t0=time.time()
+    for _ in range(20):
+        batch = next(it); f_full_step(batch)
+    torch.cuda.synchronize()
+    dt = time.time()-t0
+    print(f'  num_workers={nw:2d}  {20/dt:.2f} it/s')
+    del loader, it
+PY
+
+# Stop nvidia-smi sampler and dump last 40 lines
+kill $DMON_PID 2>/dev/null || true
+echo "---- nvidia-smi dmon (last 40 samples) ----"
+tail -40 /tmp/diag_nvsmi_$$.log
+rm -f /tmp/diag_nvsmi_$$.log
+
+echo "[INFO] End=$(date)"

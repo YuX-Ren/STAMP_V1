@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N diag_msring
+#PBS -l walltime=00:05:00
+#PBS -l select=1:ncpus=1:mem=2gb
+
+set -euo pipefail
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] date=$(date)"
+
+for p in \
+  /Project_Storage/CFP-03/CFP03-CF-130/data/molformer_encoded_msring/pubchem \
+  /Project_Storage/CFP-03/CFP03-CF-130/data/molformer_encoded_msring/zinc15 \
+  /Project_Storage/CFP-03/CFP03-CF-130/data/molformer_encoded_msring/vocab/multiscale_ring_augmented/vocab_s20000_plus_atoms.txt \
+  /scratch/yuxuan.ren/data/molformer_encoded_msring/vocab/multiscale_ring_augmented/vocab_s20000_plus_atoms.txt; do
+  echo "== ${p}"
+  ls -ld "${p}" 2>&1 || true
+done
+
+echo "[INFO] pubchem files:"
+find /Project_Storage/CFP-03/CFP03-CF-130/data/molformer_encoded_msring/pubchem -maxdepth 1 -name '*.parquet' 2>&1 | head -3 || true
+
+echo "[INFO] zinc15 files:"
+find /Project_Storage/CFP-03/CFP03-CF-130/data/molformer_encoded_msring/zinc15 -maxdepth 1 -name '*.parquet' 2>&1 | head -3 || true

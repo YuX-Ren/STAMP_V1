@@ -1,0 +1,124 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N cams_ft_kpgt
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=160gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_msring_3s_pubchem_zinc15_smilesfb/ring_single_edges}"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/kpgt/datasets}"
+OUT_BASE="${OUT_BASE:-/scratch/yuxuan.ren/data/ckpt_stamp/cams_stamp_decoder_msring_3s_pubchem_zinc15_smilesfb_kpgt_split_ft}"
+
+TASKS="${TASKS:-bbbp}"
+SPLITS="${SPLITS:-scaffold-0 scaffold-1 scaffold-2}"
+EPOCHS="${EPOCHS:-80}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+LR="${LR:-3e-5}"
+DROPOUT="${DROPOUT:-0.0}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+PATIENCE="${PATIENCE:-12}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}"
+FP_MODE="${FP_MODE:-fp_token}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
+LR_SCHEDULER="${LR_SCHEDULER:-constant}"
+END_LR="${END_LR:-1e-9}"
+DROP_LAST_TRAIN="${DROP_LAST_TRAIN:-0}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
+LOSS_NORMALIZATION="${LOSS_NORMALIZATION:-valid_mean}"
+SEED="${SEED:-42}"
+RUN_ID="${PBS_JOBID:-manual_$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-${OUT_BASE}/${RUN_ID}}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+source "${CONDA_SH}"
+set +e
+conda activate "${CONDA_ENV}"
+ACTIVATE_RC=$?
+set -e
+if [ "${ACTIVATE_RC}" -ne 0 ]; then
+  echo "[WARN] conda activate returned ${ACTIVATE_RC}; retrying after clearing active env vars" >&2
+  unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL
+  conda activate "${CONDA_ENV}"
+fi
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+
+if [ ! -d "${CHECKPOINT_DIR}" ]; then
+  echo "ERROR: missing checkpoint dir: ${CHECKPOINT_DIR}" >&2
+  exit 2
+fi
+if [ ! -d "${DATA_DIR}" ]; then
+  echo "ERROR: missing KPGT data dir: ${DATA_DIR}" >&2
+  exit 2
+fi
+
+if [ -z "${CHECKPOINT_FILE:-}" ]; then
+  CHECKPOINT_FILE="$(find "${CHECKPOINT_DIR}/checkpoints" -maxdepth 1 -type f -name 'step_*.pt' | sort | tail -n 1)"
+fi
+if [ ! -f "${CHECKPOINT_FILE}" ]; then
+  echo "ERROR: missing checkpoint file: ${CHECKPOINT_FILE}" >&2
+  exit 2
+fi
+
+mkdir -p "${OUT_DIR}/logs"
+LOG_FILE="${OUT_DIR}/logs/finetune_${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${RUN_ID}"
+echo "[INFO] checkpoint_file=${CHECKPOINT_FILE}"
+echo "[INFO] data=${DATA_DIR}"
+echo "[INFO] tasks=${TASKS}"
+echo "[INFO] splits=${SPLITS}"
+echo "[INFO] out_dir=${OUT_DIR}"
+echo "[INFO] epochs=${EPOCHS} batch_size=${BATCH_SIZE} lr=${LR} dropout=${DROPOUT} weight_decay=${WEIGHT_DECAY} patience=${PATIENCE} max_seq_len=${MAX_SEQ_LEN} fp_mode=${FP_MODE} warmup_ratio=${WARMUP_RATIO} warmup_steps=${WARMUP_STEPS} lr_scheduler=${LR_SCHEDULER} end_lr=${END_LR} drop_last_train=${DROP_LAST_TRAIN} grad_clip_norm=${GRAD_CLIP_NORM} loss_normalization=${LOSS_NORMALIZATION} seed=${SEED}"
+nvidia-smi || true
+
+EXTRA_ARGS=()
+if [ "${DROP_LAST_TRAIN}" = "1" ] || [ "${DROP_LAST_TRAIN}" = "true" ] || [ "${DROP_LAST_TRAIN}" = "TRUE" ]; then
+  EXTRA_ARGS+=(--drop-last-train)
+fi
+
+for SPLIT in ${SPLITS}; do
+  OUT_JSON="${OUT_DIR}/results_${SPLIT}.json"
+  echo "[INFO] running split=${SPLIT} out=${OUT_JSON}"
+  python scripts/benchmark/finetune_cams_decoder_pp.py \
+    --checkpoint-dir "${CHECKPOINT_DIR}" \
+    --checkpoint-file "${CHECKPOINT_FILE}" \
+    --data-dir "${DATA_DIR}" \
+    --split-source kpgt \
+    --split-name "${SPLIT}" \
+    --output "${OUT_JSON}" \
+    --tasks ${TASKS} \
+    --epochs "${EPOCHS}" \
+    --lr "${LR}" \
+    --weight-decay "${WEIGHT_DECAY}" \
+    --batch-size "${BATCH_SIZE}" \
+    --max-seq-len "${MAX_SEQ_LEN}" \
+    --dropout "${DROPOUT}" \
+    --patience "${PATIENCE}" \
+    --fp-mode "${FP_MODE}" \
+    --warmup-ratio "${WARMUP_RATIO}" \
+    --warmup-steps "${WARMUP_STEPS}" \
+    --lr-scheduler "${LR_SCHEDULER}" \
+    --end-lr "${END_LR}" \
+    --grad-clip-norm "${GRAD_CLIP_NORM}" \
+    --loss-normalization "${LOSS_NORMALIZATION}" \
+    --force-ring-aware-encode \
+    --seed "${SEED}" \
+    --device cuda \
+    "${EXTRA_ARGS[@]}" \
+    2>&1 | tee -a "${LOG_FILE}"
+done

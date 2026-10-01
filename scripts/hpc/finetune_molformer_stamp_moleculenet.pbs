@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molf_stamp_ft
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ngpus=1:ncpus=16:mem=128gb
+
+set -euo pipefail
+
+REPO_ROOT=/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+PRETRAIN_DIR="${PRETRAIN_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/molformer_stamp_original_top4k_full}"
+CHECKPOINT="${CHECKPOINT:-${PRETRAIN_DIR}/last.pt}"
+VOCAB_DIR="${VOCAB_DIR:-/scratch/yuxuan.ren/zinc_pretrain/vocab_merged}"
+DATA_DIR="${DATA_DIR:-/scratch/yuxuan.ren/data/moleculenet}"
+OUT_DIR="${OUT_DIR:-/scratch/yuxuan.ren/data/ckpt_stamp/molformer_stamp_original_top4k_full_finetune}"
+
+TASKS="${TASKS:-bbbp,hiv,bace,clintox,tox21,sider,esol,freesolv,lipophilicity}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}"
+EPOCHS="${EPOCHS:-500}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+LR="${LR:-3e-5}"
+PATIENCE="${PATIENCE:-50}"
+AMP="${AMP:-fp16}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+
+if [ ! -f "${CHECKPOINT}" ]; then
+  echo "ERROR: missing checkpoint: ${CHECKPOINT}" >&2
+  exit 2
+fi
+if [ ! -d "${DATA_DIR}" ]; then
+  echo "ERROR: missing MoleculeNet data dir: ${DATA_DIR}" >&2
+  exit 2
+fi
+
+mkdir -p "${OUT_DIR}/logs"
+LOG_FILE="${OUT_DIR}/logs/finetune_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S).log"
+STAMP_VOCAB="${VOCAB_DIR}/motif_vocab_top4k.txt"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${PBS_JOBID:-manual}"
+echo "[INFO] checkpoint=${CHECKPOINT}"
+echo "[INFO] data=${DATA_DIR}"
+echo "[INFO] out=${OUT_DIR}"
+nvidia-smi || true
+
+python scripts/benchmark/finetune_molformer_stamp_pp.py \
+  --checkpoint "${CHECKPOINT}" \
+  --output-dir "${OUT_DIR}" \
+  --data-dir "${DATA_DIR}" \
+  --tasks "${TASKS}" \
+  --stamp-vocab "${STAMP_VOCAB}" \
+  --max-seq-len "${MAX_SEQ_LEN}" \
+  --epochs "${EPOCHS}" \
+  --lr "${LR}" \
+  --batch-size "${BATCH_SIZE}" \
+  --dropout 0.1 \
+  --patience "${PATIENCE}" \
+  --pooling avg \
+  --amp "${AMP}" \
+  --device cuda \
+  --seed 42 \
+  2>&1 | tee -a "${LOG_FILE}"

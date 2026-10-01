@@ -1,0 +1,73 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -N moleculeace_mmp_locality
+#PBS -l select=1:ngpus=1:ncpus=16:mem=128gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -V
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp}"
+DEFAULT_PY="${DEFAULT_PY:-/scratch/yuxuan.ren/miniconda3/bin/python}"
+STAMP_PY="${STAMP_PY:-/scratch/yuxuan.ren/miniconda3/envs/stamp-train-rdkit-2025_09_4/bin/python}"
+MOLECULEACE_DIR="${MOLECULEACE_DIR:-/scratch/yuxuan.ren/data/moleculeace}"
+STAMP_VOCAB="${STAMP_VOCAB:-/scratch/yuxuan.ren/data/pubchem10m/vocab_psvae_ring_v10000_n20k/vocab_top4666.txt}"
+RUN_ROOT="${RUN_ROOT:-/scratch/yuxuan.ren/data/pubchem10m/moleculeace_mmp_edit_locality_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S)}"
+PROJECT_SYNC_DIR="${PROJECT_SYNC_DIR:-/Project_Storage/CFP-03/CFP03-CF-130/data/pubchem10m/$(basename "$RUN_ROOT")}"
+MAX_PAIRS_TOTAL="${MAX_PAIRS_TOTAL:-0}"
+MAX_PAIRS_PER_CONTEXT="${MAX_PAIRS_PER_CONTEXT:-0}"
+MIN_CONTEXT_HEAVY_ATOMS="${MIN_CONTEXT_HEAVY_ATOMS:-5}"
+
+export TOKENIZERS_PARALLELISM=false
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER:-user}}"
+
+cd "$REPO_DIR"
+mkdir -p "$RUN_ROOT"
+
+echo "[info] host=$(hostname)"
+echo "[info] job=${PBS_JOBID:-manual}"
+echo "[info] run_root=$RUN_ROOT"
+echo "[info] project_sync_dir=$PROJECT_SYNC_DIR"
+nvidia-smi || true
+
+COMMON_ARGS=(
+  --moleculeace-dir "$MOLECULEACE_DIR"
+  --stamp-vocab "$STAMP_VOCAB"
+  --max-pairs-total "$MAX_PAIRS_TOTAL"
+  --max-pairs-per-context "$MAX_PAIRS_PER_CONTEXT"
+  --min-context-heavy-atoms "$MIN_CONTEXT_HEAVY_ATOMS"
+)
+
+echo "[stage1] STAMP + SAFE distances"
+"$DEFAULT_PY" scripts/benchmark/moleculeace_mmp_edit_locality.py \
+  "${COMMON_ARGS[@]}" \
+  --representations stamp safe \
+  --skip-plots \
+  --output-dir "$RUN_ROOT/stage1_stampsafe"
+
+echo "[stage2] append SMILES-BPE distances"
+"$STAMP_PY" scripts/benchmark/moleculeace_mmp_edit_locality.py \
+  --input-csv "$RUN_ROOT/stage1_stampsafe/mmp_edit_locality_pairs.csv" \
+  --append-distances \
+  --representations smiles_bpe \
+  --smiles-bpe-local-files-only \
+  --skip-plots \
+  --output-dir "$RUN_ROOT/stage2_allreps"
+
+echo "[stage3] final summary + figures"
+"$DEFAULT_PY" scripts/benchmark/moleculeace_mmp_edit_locality.py \
+  --input-csv "$RUN_ROOT/stage2_allreps/mmp_edit_locality_pairs.csv" \
+  --representations stamp safe smiles_bpe \
+  --output-dir "$RUN_ROOT/final"
+
+if [ -n "$PROJECT_SYNC_DIR" ] && [ -d "$(dirname "$PROJECT_SYNC_DIR")" ]; then
+  echo "[stage4] sync to project storage"
+  mkdir -p "$PROJECT_SYNC_DIR"
+  rsync -a "$RUN_ROOT/" "$PROJECT_SYNC_DIR/"
+  echo "Synced final outputs to $PROJECT_SYNC_DIR/final"
+else
+  echo "[warn] project storage parent is not visible on this node; skipped sync."
+fi
+
+echo "Saved final outputs to $RUN_ROOT/final"

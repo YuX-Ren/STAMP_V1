@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N diag_project
+#PBS -l walltime=00:10:00
+#PBS -l select=1:ncpus=1:mem=4gb
+
+set -u
+
+echo "host=$(hostname)"
+echo "pwd=$(pwd)"
+ls -ld /Project_Storage 2>&1
+ls -ld /Project_Storage/CFP-03/CFP03-CF-130/data/zinc_pretrain/output_multiscale 2>&1
+find /Project_Storage/CFP-03/CFP03-CF-130/data/zinc_pretrain/output_multiscale -maxdepth 1 -name 'train_*_ms.parquet' 2>&1 | head -n 3
+ls -ld /scratch/yuxuan.ren 2>&1

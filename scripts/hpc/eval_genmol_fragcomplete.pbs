@@ -1,0 +1,11 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N eval_gm_frag_cmpl
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ngpus=1:ncpus=4:mem=32gb
+
+set -u
+source /scratch/yuxuan.ren/miniconda3/bin/activate stamp-train-rdkit-2025_09_4
+python /home/svu/yuxuan.ren/eval_genmol_fragcomplete.py

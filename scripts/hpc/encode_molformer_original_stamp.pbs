@@ -1,0 +1,83 @@
+#!/bin/bash
+#PBS -P CFP03-CF-130
+#PBS -j oe
+#PBS -k oed
+#PBS -N molf_stamp_enc
+#PBS -l walltime=72:00:00
+#PBS -l select=1:ncpus=32:mem=160gb
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/nfs/home/svu/yuxuan.ren/STAMP_V1.5_pp}"
+CONDA_ENV="${CONDA_ENV:-stamp-train-rdkit-2025_09_4}"
+CONDA_SH="${CONDA_SH:-/scratch/yuxuan.ren/miniconda3/etc/profile.d/conda.sh}"
+
+SCRATCH_ROOT="${SCRATCH_ROOT:-/scratch/yuxuan.ren/data/molformer_original}"
+DOWNLOADS_DIR="${DOWNLOADS_DIR:-${SCRATCH_ROOT}/downloads}"
+RAW_DIR="${RAW_DIR:-${SCRATCH_ROOT}/raw}"
+OUT_DIR="${OUT_DIR:-${SCRATCH_ROOT}/stamp_4k}"
+VOCAB_FILE="${VOCAB_FILE:-/scratch/yuxuan.ren/zinc_pretrain/vocab_merged/motif_vocab_top4k.txt}"
+
+SHARD_INDEX="${SHARD_INDEX:-${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-0}}}"
+NUM_SHARDS="${NUM_SHARDS:-128}"
+SOURCE="${SOURCE:-all}"
+N_WORKERS="${N_WORKERS:-24}"
+BATCH_SIZE="${BATCH_SIZE:-10000}"
+MAX_ROWS="${MAX_ROWS:-0}"
+MAX_SMILES_LEN="${MAX_SMILES_LEN:-211}"
+FRAGMENT_POLICY="${FRAGMENT_POLICY:-largest}"
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM=false
+
+source "${CONDA_SH}"
+conda activate "${CONDA_ENV}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}/logs"
+
+PUBCHEM_SMI="${PUBCHEM_SMI:-${RAW_DIR}/pubchem-canonical/CID-SMILES-CANONICAL.smi}"
+PUBCHEM_ZIP="${PUBCHEM_ZIP:-${DOWNLOADS_DIR}/pubchem_smiles_canonical.zip}"
+ZINC_ZIP="${ZINC_ZIP:-${DOWNLOADS_DIR}/ZINC15_smiles.zip}"
+
+if [ ! -f "${VOCAB_FILE}" ]; then
+  echo "ERROR: VOCAB_FILE missing: ${VOCAB_FILE}" >&2
+  exit 2
+fi
+if [ ! -f "${PUBCHEM_SMI}" ] && [ ! -f "${PUBCHEM_ZIP}" ]; then
+  echo "ERROR: PubChem input missing: ${PUBCHEM_SMI} or ${PUBCHEM_ZIP}" >&2
+  exit 2
+fi
+if [ "${SOURCE}" != "pubchem" ] && [ ! -f "${ZINC_ZIP}" ]; then
+  echo "ERROR: ZINC_ZIP missing: ${ZINC_ZIP}" >&2
+  exit 2
+fi
+
+LOG_FILE="${OUT_DIR}/logs/encode_${SHARD_INDEX}_of_${NUM_SHARDS}_${PBS_JOBID:-manual}_$(date +%Y%m%d_%H%M%S).log"
+
+echo "[INFO] host=$(hostname)"
+echo "[INFO] job=${PBS_JOBID:-manual}"
+echo "[INFO] shard=${SHARD_INDEX}/${NUM_SHARDS} source=${SOURCE}"
+echo "[INFO] pubchem_smi=${PUBCHEM_SMI}"
+echo "[INFO] pubchem_zip=${PUBCHEM_ZIP}"
+echo "[INFO] zinc_zip=${ZINC_ZIP}"
+echo "[INFO] out=${OUT_DIR}"
+echo "[INFO] vocab=${VOCAB_FILE}"
+
+python -u scripts/benchmark/encode_molformer_original_to_stamp.py \
+  --pubchem-smi "${PUBCHEM_SMI}" \
+  --pubchem-zip "${PUBCHEM_ZIP}" \
+  --zinc-zip "${ZINC_ZIP}" \
+  --source "${SOURCE}" \
+  --out-dir "${OUT_DIR}" \
+  --shard-index "${SHARD_INDEX}" \
+  --num-shards "${NUM_SHARDS}" \
+  --stamp-vocab "${VOCAB_FILE}" \
+  --n-workers "${N_WORKERS}" \
+  --batch-size "${BATCH_SIZE}" \
+  --max-rows "${MAX_ROWS}" \
+  --max-smiles-len "${MAX_SMILES_LEN}" \
+  --fragment-policy "${FRAGMENT_POLICY}" \
+  2>&1 | tee -a "${LOG_FILE}"
