@@ -66,6 +66,12 @@ not versioned. Keep them under `data/`, `results/`, or external storage. HPC
 scripts contain cluster-specific defaults and should be configured through their
 environment variables before use.
 
+The matching data snapshot is hosted separately in the private
+[`bi0s/STAMP_V1-data`](https://huggingface.co/datasets/bi0s/STAMP_V1-data)
+Hugging Face dataset. Download it and copy `stamp-v1.5pp/data/` into this
+checkout's `data/` directory; the dataset card includes provenance and SHA-256
+checksums.
+
 Optional representations and reference implementations can be installed as
 packages or cloned under `third_party/`. See
 [the experiment guide](docs/experiments.md) and
