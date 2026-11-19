@@ -1,0 +1,3 @@
+# CPU codec demo only. Research training uses the conda environment separately.
+rdkit==2023.9.6
+numpy==1.26.4

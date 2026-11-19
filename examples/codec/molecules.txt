@@ -1,0 +1,10 @@
+CCO
+CC(=O)O
+CC(C)O
+c1ccccc1
+Cc1ccccc1
+CCOc1ccccc1
+C1CCCCC1
+CCN(CC)CC
+CC(c1ccccc1)c1ccccc1
+CCOc1ccccc1OCC

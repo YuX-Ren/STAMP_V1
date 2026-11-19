@@ -2,7 +2,10 @@
 
 The repository keeps source code and lightweight documentation in Git. Datasets,
 checkpoints, scheduler logs, generated figures, and result tables are local
-artifacts and are excluded by `.gitignore`.
+artifacts and are excluded by `.gitignore`. The small CPU demonstration under
+`examples/codec/` is included in source control, with pinned dependencies,
+expected output and a GitHub Actions check. Start with the [README](../README.md)
+for this demo and [data and model access](data_and_model_access.md) for study assets.
 
 ## Environments
 
