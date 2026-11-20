@@ -61,3 +61,8 @@ Thumbs.db
 /AGENTS.md
 /CLAUDE.md
 /.licenses/
+
+# Small publication assets and benchmark queries shipped with the examples.
+!/assets/method.pdf
+!/assets/results/
+!/examples/fragments/*.parquet

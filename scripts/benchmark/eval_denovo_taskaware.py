@@ -10,6 +10,7 @@ Metrics match GenMol convention:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -309,6 +310,18 @@ def main() -> int:
     }
     out_json = out_dir / "denovo_eval.json"
     out_json.write_text(json.dumps(summary, indent=2))
+    with (out_dir / "denovo_samples.tsv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow(["smiles", "qed", "sa"])
+        for smiles in eval_unique:
+            mol = Chem.MolFromSmiles(smiles)
+            sa_value = None
+            if sa is not None:
+                try:
+                    sa_value = float(sa.calculateScore(mol))
+                except Exception:
+                    pass
+            writer.writerow([smiles, float(QED.qed(mol)), sa_value])
     print(f"\nWrote {out_json}\n")
 
     print(f"=== DE-NOVO SUMMARY ===")
