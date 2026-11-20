@@ -55,3 +55,9 @@ paper_edit_geometry_*/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Local research notes and agent instructions are not release documentation.
+/docs/
+/AGENTS.md
+/CLAUDE.md
+/.licenses/
