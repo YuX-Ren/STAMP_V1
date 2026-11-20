@@ -169,17 +169,21 @@ parquet (`text2mol_source`, `text2mol_target`, `smiles` columns):
 ```bash
 python -m pip install -r envs/requirements-translation.txt
 hf download bi0s/STAMP_V1 --include 'molt5_text2mol_from500k/*' --local-dir checkpoints
+hf download bi0s/STAMP_V1-data main/data/chebi20/finetune_zinc_curated30k/test.parquet \
+  --repo-type dataset --local-dir datasets
 python scripts/benchmark/eval_molt5_chebi20.py \
   --ckpt-dir checkpoints/molt5_text2mol_from500k \
   --stamp-vocab checkpoints/molt5_text2mol_from500k/motif_vocab.txt \
-  --test-parquet path/to/chebi20_test.parquet --direction text2mol \
+  --test-parquet datasets/main/data/chebi20/finetune_zinc_curated30k/test.parquet --direction text2mol \
   --num-beams 5 --max-new-tokens 256 --batch-size 32 --device cuda \
   --output-dir results/text2mol
 ```
 
-Outputs include predictions and metrics. The full prepared ChEBI-20 test file
-is not bundled with the fragment queries. The study data repository currently
-requires account access.
+Outputs include predictions and metrics. Training corpora, prepared ChEBI-20
+splits, property datasets and checksums are available in the public
+[data repository](https://huggingface.co/datasets/bi0s/STAMP_V1-data).
+Its [file index](https://huggingface.co/datasets/bi0s/STAMP_V1-data/blob/main/main/data/manifests/release_files.tsv)
+lists the actual downloadable files.
 
 ## Code layout
 
