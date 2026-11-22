@@ -34,7 +34,7 @@ _REPO = Path(__file__).resolve().parents[3]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from mcts_protype import Oracle  # noqa: E402
+from ..oracle import Oracle
 
 
 # The canonical PMO suite used by GenMol / PMO papers.
@@ -73,6 +73,14 @@ class PMOOracle(Oracle):
     """
 
     def __init__(self, task_name: str, max_calls: int = 10_000) -> None:
+        # PyTDC 1.0 imports the six compatibility module formerly bundled by
+        # RDKit. Use the standalone equivalent with the PMO RDKit version.
+        try:
+            import rdkit.six
+        except ModuleNotFoundError:
+            import six
+
+            sys.modules.setdefault("rdkit.six", six)
         from tdc import Oracle as TDCOracle
         self._task_name = task_name
         self._oracle = TDCOracle(name=task_name)

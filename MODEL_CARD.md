@@ -18,7 +18,7 @@ selected directory, including its vocabulary and configuration files.
 
 | Directory | Intended task | Model file | Version |
 | --- | --- | --- | --- |
-| `ao_generation` | De novo molecular generation | `model.pt` | AO-GPT rerun, selected step 300,000 |
+| `ao_generation` | De novo generation and frozen PMO mutation | `model.pt` | AO-GPT rerun, selected step 300,000 |
 | `fragment_infill` | Linker design, motif extension and superstructure generation | `model.pt` | Balanced infill adaptation, 3 epochs |
 | `scaffold_decoration` | Scaffold decoration | `model.pt` | Additional task adaptation, 10 epochs |
 | `encoder_mlm` | Molecular embeddings and supervised property fine-tuning | `pretrained_roberta.pt` | PubChem MLM, final epoch 10 |
@@ -290,6 +290,15 @@ Each downstream model directory includes `evaluation_metrics.json` with its
 full archived metric record from `eval_test_v2`. Both released MolT5 models
 were adapted from the step-350,000 pretraining checkpoint; standalone
 pretraining weights are not included.
+
+### PMO use of the pretrained baseline
+
+The PMO runner uses the same `ao_generation` weights (112,057,459 parameters)
+as a frozen motif-span mutation model. No additional PMO checkpoint is needed.
+The released `run_pmo_baseline.py` uses the shared no-surrogate, no-niching
+configuration with a 10,000-call budget per task. See the
+[PMO command](https://github.com/YuX-Ren/STAMP_V1#practical-molecular-optimization-pmo)
+for input downloads and execution.
 
 ## Download and use
 

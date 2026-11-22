@@ -1,0 +1,11 @@
+# PMO oracle dependencies; install PyTDC separately with --no-deps as in README.
+# Its broad dependency metadata otherwise downgrades the required RDKit version.
+rdkit==2025.9.4
+numpy>=1.26.4,<2
+scikit-learn==1.2.2
+fuzzywuzzy==0.18.0
+six>=1.16
+networkx>=2.8
+packaging
+setuptools<81
+huggingface_hub

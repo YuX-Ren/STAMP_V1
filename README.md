@@ -189,6 +189,36 @@ The [LLM task snapshots](https://huggingface.co/datasets/bi0s/STAMP_V1-data/tree
 include six S2 tasks (500 examples each), 120 shared-label transfer examples
 and 100 change-identification pairs, with their original experiment manifests.
 
+### Practical molecular optimization (PMO)
+
+PMO uses the same frozen 112M pretraining baseline, `ao_generation`.
+The shared configuration in `scripts/benchmark/configs/pmo_no_surrogate.json`
+disables surrogate ranking and scaffold niching. Each of the 23 tasks uses
+10,000 oracle calls and reports AUC of the top-10 mean reward.
+
+After creating the training environment, install the PMO dependencies. PyTDC
+is installed separately to preserve RDKit 2025.09.4:
+
+```bash
+python -m pip install -r envs/requirements-pmo.txt
+python -m pip install --no-deps PyTDC==1.0.0
+hf download bi0s/STAMP_V1 --include 'ao_generation/*' --local-dir checkpoints
+hf download bi0s/STAMP_V1-data --repo-type dataset \
+  --include 'main/data/pmo/*' --local-dir datasets
+mkdir -p oracle
+cp -n datasets/main/data/pmo/oracle/*.pkl oracle/
+PYTHONHASHSEED=0 python scripts/benchmark/run_pmo_baseline.py \
+  --model-dir checkpoints/ao_generation \
+  --vocab-dir datasets/main/data/pmo/fragment_vocab \
+  --task qed --seed 1 --device cpu --threads 1 \
+  --output results/pmo/qed/s1.json
+```
+
+Use any task name from `PMO_TASKS` in
+`stamp/benchmark/mcts_unified/pmo_oracle.py`. For a quick check, add `--budget 12`.
+Outputs are the result JSON, `.meta.json` provenance and `.oracle.jsonl` trace.
+Existing run artifacts are never overwritten.
+
 ## Code layout
 
 | Directory | Contents |
