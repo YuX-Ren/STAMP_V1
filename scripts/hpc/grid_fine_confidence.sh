@@ -34,7 +34,7 @@ out_dir  = Path('${OUT_DIR}')
 
 _, vocab = _load_scan_cache(ckpt_dir)
 ckpt = torch.load(ckpt_dir / 'model.pt', map_location='cpu', weights_only=False)
-cfg = LMConfig(**ckpt['cfg'])
+cfg = LMConfig.from_dict(ckpt['cfg'])
 cfg.model_type = _normalize_model_type(str(ckpt.get('model_type', cfg.model_type)))
 dev = torch.device('cuda:0')
 model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg).to(dev)

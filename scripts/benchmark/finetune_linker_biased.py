@@ -15,7 +15,7 @@ Usage:
   python scripts/benchmark/finetune_linker_biased.py \\
       --parquet /scratch/yuxuan.ren/data/dataset_stamp_decontam.parquet \\
       --stamp-vocab /scratch/.../motif_vocab.txt \\
-      --init-ckpt /scratch/.../stamp_hybrid_30m_d512_l8_e10_cut5k/checkpoints/epoch_0007/model.pt \\
+      --init-ckpt checkpoints/ao_generation/model.pt \\
       --output-dir /scratch/.../linker_ft_e1 \\
       --epochs 1 --batch-size 128 --lr 5e-5 --linker-prob 0.7
 """
@@ -283,7 +283,7 @@ def main():
 
     # Build model + load checkpoint
     ckpt = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
-    cfg = LMConfig(**ckpt["cfg"]); cfg.use_adaln = True
+    cfg = LMConfig.from_dict(ckpt["cfg"]); cfg.use_adaln = True
     model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=False).to(dev)
     state = ckpt["model_state"]
     if any(k.startswith("_orig_mod.") for k in state):

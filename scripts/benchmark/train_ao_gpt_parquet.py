@@ -38,8 +38,6 @@ from stamp.benchmark.lm import (  # noqa: E402
     TinyDecoderLM,
     TokenVocab,
     _compute_ao_gpt_loss,
-    _compute_ar_loss,
-    LlamaDecoderLM,
     _resolve_amp_mode,
     _resolve_torch_device,
     _set_seed,
@@ -1402,9 +1400,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model-type",
         default="ao_gpt",
-        choices=["ao_gpt", "llama"],
-        help="ao_gpt = TinyDecoderLM with AdaLN/target_pos_emb (random AO orders + AR). "
-             "llama = LlamaDecoderLM clean AR (RoPE + RMSNorm + SwiGLU + tied emb, no biases).",
+        choices=["ao_gpt"],
+        help="AO-GPT with AdaLN/target_pos_emb (random AO orders + AR).",
     )
     p.add_argument(
         "--ao-random-ratio",
@@ -1688,14 +1685,8 @@ def main() -> int:
 
     use_amp, amp_dtype, use_scaler, _amp_label = _resolve_amp_mode(cfg.amp, dev)
     _debug_print(debug, f"[debug rank={_dist_rank()}] amp={args.amp} resolved_dtype={amp_dtype}")
-    is_llama = str(cfg.model_type).strip().lower() == "llama"
-    if is_llama:
-        model = LlamaDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
-        loss_fn = lambda m, x, y: _compute_ar_loss(m, x, y)
-        _debug_print(debug, "[debug] using LlamaDecoderLM (pure AR, RoPE+RMSNorm+SwiGLU, tied emb)")
-    else:
-        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
-        loss_fn = lambda m, x, y: _compute_ao_gpt_loss(m, x, y, cfg, random_ratio=cfg.ao_random_ratio)
+    model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
+    loss_fn = lambda m, x, y: _compute_ao_gpt_loss(m, x, y, cfg, random_ratio=cfg.ao_random_ratio)
     _debug_print(debug, f"[debug rank={_dist_rank()}] model_created")
     init_path = str(args.init_from or "").strip()
     if init_path and str(args.resume_from or "").strip():
@@ -1714,16 +1705,7 @@ def main() -> int:
     _debug_print(debug, f"[debug rank={_dist_rank()}] model_to_device_done")
     if _is_dist():
         _debug_print(debug, f"[debug rank={_dist_rank()}] before_ddp_wrap")
-        # broadcast_buffers=False: our RoPE cos/sin buffers (LlamaDecoderLM) are
-        # deterministic-identical across ranks, so per-forward broadcast is a
-        # waste of NCCL bandwidth AND a desync risk (different ranks reaching
-        # the broadcast at different timings causes NCCL watchdog timeouts).
-        # static_graph=True: required for tied weights (LlamaDecoderLM ties
-        # head.weight = tok_emb.weight). Without it, DDP's reducer double-counts
-        # the shared parameter's gradient bucket, producing a different number
-        # of all-reduce ops per rank → NCCL desync mid-epoch (worse with bigger
-        # models where timing drift exposes it). static_graph also lets DDP
-        # skip the unused-param trace each step.
+        # Static graphs support tied embeddings; avoid redundant buffer broadcasts.
         model = DDP(
             model,
             device_ids=[dev.index] if dev.type == "cuda" and dev.index is not None else None,

@@ -34,7 +34,6 @@ from stamp.benchmark.hybrid_vocab import (  # noqa: E402
 )
 from stamp.benchmark.lm import (  # noqa: E402
     LMConfig,
-    LlamaDecoderLM,
     TinyDecoderLM,
     TokenVocab,
     _normalize_model_type,
@@ -69,14 +68,11 @@ def _load_vocab(model_dir: Path) -> tuple[Any, TokenVocab, bool]:
 
 def _load_model(checkpoint: Path, model_dir: Path, device: str | None):
     ckpt = torch.load(checkpoint, map_location="cpu")
-    cfg = LMConfig(**ckpt["cfg"])
+    cfg = LMConfig.from_dict(ckpt["cfg"])
     model_type = _normalize_model_type(str(ckpt.get("model_type", cfg.model_type)))
     cfg.model_type = model_type
     vocab, sample_vocab, is_hybrid = _load_vocab(model_dir)
-    if model_type == "llama":
-        model = LlamaDecoderLM(vocab_size=len(sample_vocab.itos), cfg=cfg)
-    else:
-        model = TinyDecoderLM(vocab_size=len(sample_vocab.itos), cfg=cfg)
+    model = TinyDecoderLM(vocab_size=len(sample_vocab.itos), cfg=cfg)
     model.load_state_dict(_unwrap_state_dict(ckpt["model_state"]))
     dev = _resolve_torch_device(device)
     model.to(dev)

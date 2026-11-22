@@ -191,7 +191,7 @@ def main():
                           persistent_workers=(args.num_data_workers > 0))
 
     ckpt = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
-    cfg = LMConfig(**ckpt["cfg"]); cfg.use_adaln = True
+    cfg = LMConfig.from_dict(ckpt["cfg"]); cfg.use_adaln = True
     model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=False).to(dev)
     state = ckpt["model_state"]
     if any(k.startswith("_orig_mod.") for k in state):

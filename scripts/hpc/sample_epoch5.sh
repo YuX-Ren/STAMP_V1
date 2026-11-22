@@ -34,7 +34,7 @@ print(f'[sample] vocab={len(vocab.itos)}  pad={vocab.pad_id} bos={vocab.bos_id} 
 
 # ---- load model ----
 ckpt = torch.load(ckpt_dir / 'model.pt', map_location='cpu', weights_only=False)
-cfg = LMConfig(**ckpt['cfg'])
+cfg = LMConfig.from_dict(ckpt['cfg'])
 cfg.model_type = _normalize_model_type(str(ckpt.get('model_type', cfg.model_type)))
 print(f'[sample] model_type={cfg.model_type}  epoch={ckpt.get("epoch","?")}  params={sum(ckpt["model_state"][k].numel() for k in ckpt["model_state"])/1e6:.2f}M', flush=True)
 

@@ -34,7 +34,7 @@ run_dir = Path('${RUN_DIR}')
 ckpt_path = Path('${CKPT_PATH}')
 _, vocab = _load_scan_cache(run_dir)
 ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-cfg = LMConfig(**ckpt['cfg']); cfg.use_adaln = True
+cfg = LMConfig.from_dict(ckpt['cfg']); cfg.use_adaln = True
 cfg.model_type = 'ao_gpt'
 
 dev = torch.device('cuda:0')

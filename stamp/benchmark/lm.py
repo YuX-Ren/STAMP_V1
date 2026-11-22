@@ -25,7 +25,7 @@ _WORKER_REP: Optional[BaseRepresentation] = None
 
 @dataclass
 class LMConfig:
-    model_type: str = "decoder"  # decoder | diffusion
+    model_type: str = "decoder"  # decoder | ao_gpt | ao_gpt_pp
     d_model: int = 256
     n_heads: int = 8
     n_layers: int = 4
@@ -43,18 +43,8 @@ class LMConfig:
     amp: str = "auto"  # auto | bf16 | fp16 | none
     torch_compile: bool = False
     tf32: bool = True
-    diffusion_steps: int = 128
-    diffusion_time_epsilon: float = 1e-3
-    diffusion_scheduler: str = "linear"  # linear | cosine
-    diffusion_loss_weight: str = "scheduler"  # scheduler | uniform
-    diffusion_remasking: str = "low_confidence"  # low_confidence | random
-    diffusion_stochastic_transfer: bool = False
-    diffusion_block_size: int = 0  # <=0 means full generation window
-    diffusion_tokens_per_step: int = 0
-    diffusion_chemical_role_masking: bool = False
-    diffusion_structure_constraints: bool = False
     # When False, skip AdaLN modulation and the none_emb/target_pos_emb machinery
-    # used by AO-GPT. Standard masked-diffusion (MDM/MDLM) sets this to False.
+    # used by AO-GPT.
     use_adaln: bool = True
     # ao_gpt_pp (property-prediction) type-aware masking. Only consulted when
     # model_type == "ao_gpt_pp"; the plain "ao_gpt" path ignores these.
@@ -75,6 +65,11 @@ class LMConfig:
     # Tie input token embedding with output head weight. Standard for modern
     # LMs; saves vocab*d_model params (e.g. 51K*1024 = 52M for d=1024).
     tied_embeddings: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "LMConfig":
+        """Read supported fields from archived checkpoint configurations."""
+        return cls(**{key: value for key, value in payload.items() if key in cls.__dataclass_fields__})
 
 
 class TokenVocab:
@@ -204,190 +199,7 @@ def build_dynamic_lm_collate_fn(pad_id: int, pad_to_multiple_of: Optional[int] =
     return _collate
 
 
-class DenoiseDataset(Dataset):
-    def __init__(self, sequences: Sequence[List[int]], max_seq_len: int) -> None:
-        self.samples: List[List[int]] = []
-        for seq in sequences:
-            ids = seq[:max_seq_len]
-            if len(ids) < 2:
-                continue
-            self.samples.append(ids)
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> List[int]:
-        return self.samples[idx]
-
-
-def build_dynamic_denoise_collate_fn(
-    pad_id: int,
-    pad_to_multiple_of: Optional[int] = None,
-):
-    def _collate(batch: Sequence[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        max_len = max(len(x) for x in batch)
-        if pad_to_multiple_of is not None and pad_to_multiple_of > 1:
-            rem = max_len % pad_to_multiple_of
-            if rem != 0:
-                max_len += pad_to_multiple_of - rem
-
-        bsz = len(batch)
-        x_out = torch.full((bsz, max_len), pad_id, dtype=torch.long)
-        y_out = torch.full((bsz, max_len), -100, dtype=torch.long)
-        for i, ids in enumerate(batch):
-            n = len(ids)
-            x_out[i, :n] = torch.tensor(ids, dtype=torch.long)
-            y_out[i, :n] = torch.tensor(ids, dtype=torch.long)
-            y_out[i, 0] = -100  # keep BOS fixed
-        return x_out, y_out
-
-    return _collate
-
-
 _ADALN_COND_DIM = 128
-
-
-# ============================================================================
-# Llama-style AR GPT — clean baseline for left-to-right AR training.
-# No AO-GPT machinery (target_pos_emb, AdaLN, shuffle, none_emb). Uses RoPE,
-# RMSNorm, SwiGLU FFN, tied embeddings, no biases. Use cfg.model_type='llama'.
-# ============================================================================
-
-
-def _precompute_rope_freqs(d_head: int, max_seq_len: int, base: float = 10000.0,
-                          dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return (cos, sin) of shape (max_seq_len, d_head)."""
-    inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2, dtype=torch.float32) / d_head))
-    t = torch.arange(max_seq_len, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)
-    # duplicate to full d_head (interleaved chunks for [x1; x2] rotation)
-    emb = torch.cat([freqs, freqs], dim=-1)
-    return emb.cos().to(dtype), emb.sin().to(dtype)
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: (B, H, T, D). cos/sin: (T, D). Apply RoPE rotation."""
-    T = x.size(-2)
-    cos_t = cos[:T].to(x.dtype).unsqueeze(0).unsqueeze(0)  # (1,1,T,D)
-    sin_t = sin[:T].to(x.dtype).unsqueeze(0).unsqueeze(0)
-    x1, x2 = x.chunk(2, dim=-1)
-    rotated = torch.cat([-x2, x1], dim=-1)
-    return x * cos_t + rotated * sin_t
-
-
-class _LlamaAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.d_model = d_model
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
-        self.q_norm = _RMSNorm(self.d_head)
-        self.k_norm = _RMSNorm(self.d_head)
-        self.resid_dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size()
-        q, k, v = self.qkv(x).split(C, dim=-1)
-        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        q, k = self.q_norm(q), self.k_norm(k)
-        q = _apply_rope(q, cos, sin)
-        k = _apply_rope(k, cos, sin)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.out(y))
-
-
-class _LlamaSwiGLU(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
-        super().__init__()
-        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
-
-
-class _LlamaBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float) -> None:
-        super().__init__()
-        self.attn_norm = _RMSNorm(d_model)
-        self.attn = _LlamaAttention(d_model, n_heads, dropout)
-        self.ffn_norm = _RMSNorm(d_model)
-        self.ffn = _LlamaSwiGLU(d_model, d_ff, dropout)
-
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), cos, sin)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class LlamaDecoderLM(nn.Module):
-    """Clean Llama-style AR GPT: RoPE + RMSNorm + SwiGLU + tied embeddings,
-    no biases. Standard left-to-right causal attention. Use this for AR
-    training/inference; far simpler than the AO-GPT TinyDecoderLM and
-    eliminates the train↔inference paradigm mismatch (random AO orders during
-    training vs identity AR at inference)."""
-
-    def __init__(self, vocab_size: int, cfg: LMConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.vocab_size = vocab_size
-        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
-        self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([
-            _LlamaBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
-            for _ in range(cfg.n_layers)
-        ])
-        self.norm = _RMSNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
-        # Tied embeddings (Llama / GPT-2 default)
-        self.head.weight = self.tok_emb.weight
-        # RoPE freqs
-        cos, sin = _precompute_rope_freqs(cfg.d_model // cfg.n_heads, cfg.max_seq_len)
-        self.register_buffer("rope_cos", cos, persistent=False)
-        self.register_buffer("rope_sin", sin, persistent=False)
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith(("out.weight", "down_proj.weight")):
-                nn.init.trunc_normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers), a=-0.06, b=0.06)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
-
-    def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
-        """AR forward. Ignores `orders` kwarg if passed (Llama is pure AR)."""
-        B, T = input_ids.shape
-        if T > self.cfg.max_seq_len:
-            raise ValueError(f"sequence length {T} exceeds max_seq_len={self.cfg.max_seq_len}")
-        x = self.drop(self.tok_emb(input_ids))
-        for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
-        x = self.norm(x)
-        return self.head(x)
-
-
-def _compute_ar_loss(model, clean_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Standard next-token CE for AR LM. labels has -100 at positions to ignore
-    (PAD, BOS already shifted out by the data pipeline)."""
-    logits = model(clean_ids)
-    return F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
-        ignore_index=-100,
-    )
 
 
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -566,379 +378,6 @@ class TinyDecoderLM(nn.Module):
         return logits[:, 1:, :]
 
 
-def _block_diff_mask(n: int, device: torch.device) -> torch.Tensor:
-    """Block_diff attention mask for Eso-LM sequential branch (block_size=1).
-
-    Operates on a concatenated [zt, x0] sequence of length 2n. Each zt query
-    attends to (i) itself (block_diagonal), (ii) x0 positions strictly earlier
-    in sort order (offset_block_causal). Each x0 query attends causally to
-    itself and earlier x0 positions (block_causal). x0 positions never attend
-    to zt positions. Returns a bool tensor of shape [2n, 2n].
-    """
-    total = 2 * n
-    q_idx = torch.arange(total, device=device).unsqueeze(1)  # [2n, 1]
-    kv_idx = torch.arange(total, device=device).unsqueeze(0)  # [1, 2n]
-    x0_flag_q = q_idx >= n
-    x0_flag_kv = kv_idx >= n
-    block_q = torch.where(x0_flag_q, q_idx - n, q_idx)
-    block_kv = torch.where(x0_flag_kv, kv_idx - n, kv_idx)
-    block_diagonal = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
-    offset_block_causal = (block_q > block_kv) & x0_flag_kv & (~x0_flag_q)
-    block_causal = (block_q >= block_kv) & x0_flag_kv & x0_flag_q
-    return (block_diagonal | offset_block_causal | block_causal)
-
-
-class TinyEsoDiT(nn.Module):
-    """Eso-LM backbone (arXiv 2506.01928).
-
-    Sequential branch (used when some positions are kept clean, alpha_0 < 1):
-      input = concat([zt_sorted, x0_sorted]) of length 2n
-      attention = block_diff_mask (block_size=1)
-        - zt[q] sees self + x0[0..q-1]
-        - x0[q] sees causally over x0 half only
-      output = logits at first n positions (zt positions)
-
-    Diffusion branch (alpha_0 = 1, pure MDM):
-      input = zt_sorted of length n
-      attention = bidirectional
-      output = logits [B, n, V]
-
-    Positional embeddings are learned and gathered by sort_idx so that each
-    sorted position carries its original-layout positional signature. The
-    zt and x0 halves share the same per-position pos embs.
-    """
-
-    def __init__(self, vocab_size: int, cfg: LMConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
-        self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([
-            _AOBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout, use_adaln=False)
-            for _ in range(cfg.n_layers)
-        ])
-        self.final_norm = _RMSNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, vocab_size, bias=True)
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                nn.init.trunc_normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers), a=-0.06, b=0.06)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-0.06, b=0.06)
-
-    def forward(
-        self,
-        zt: torch.Tensor,
-        x0: Optional[torch.Tensor],
-        sort_idx: torch.Tensor,
-        mode: str = "sequential",
-    ) -> torch.Tensor:
-        device = zt.device
-        B, n = zt.shape
-        if n > self.cfg.max_seq_len:
-            raise ValueError(f"sequence length {n} exceeds max_seq_len={self.cfg.max_seq_len}")
-
-        pos_ids = sort_idx  # [B, n]; each position carries its original index's pos_emb
-        pos_embs = self.pos_emb(pos_ids)  # [B, n, d]
-
-        if mode == "diffusion":
-            tok = self.tok_emb(zt) + pos_embs
-            x = self.drop(tok)
-            for block in self.blocks:
-                # bidirectional: pass a 1 mask (all-True = bidirectional) or skip via is_causal=False
-                x = block(x, cond=None, is_causal=False, attn_mask=None)
-            x = self.final_norm(x)
-            return self.head(x)
-
-        # sequential mode: concat [zt, x0], run block_diff_mask attention
-        if x0 is None:
-            raise ValueError("sequential mode requires x0")
-        tok_zt = self.tok_emb(zt) + pos_embs
-        tok_x0 = self.tok_emb(x0) + pos_embs
-        x = self.drop(torch.cat([tok_zt, tok_x0], dim=1))  # [B, 2n, d]
-
-        attn_mask = _block_diff_mask(n, device=device)  # [2n, 2n] bool
-        # Expand for SDPA: broadcasting handles batch+heads
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, 2n, 2n]
-
-        for block in self.blocks:
-            x = block(x, cond=None, is_causal=False, attn_mask=attn_mask)
-        x = self.final_norm(x)
-        logits = self.head(x)
-        return logits[:, :n, :]  # first half = zt positions
-
-
-def _compute_sort_idx(
-    xt: torch.Tensor,
-    mask_id: int,
-    shuffle_unmasked: bool = False,
-) -> torch.Tensor:
-    """Compute sort index so unmasked tokens come first (shuffled or sequential)
-    and masked tokens come last in sequential order within each row (per the
-    official Eso-LM sort_indices algorithm)."""
-    B, n = xt.shape
-    device = xt.device
-    masked = (xt == mask_id)
-    if shuffle_unmasked:
-        offsets = torch.rand((B, n), device=device) * 0.9
-    else:
-        offsets = torch.linspace(0.0, 0.9, n, device=device).unsqueeze(0).expand(B, n).clone()
-    # Masks get a monotone offset in [0, 1] so they sort after the unmasked block
-    # (which has offset < 0.9). Within each row, earlier masked indices get
-    # smaller offsets so they end up sequentially at the tail.
-    total_masked = int(masked.sum().item())
-    if total_masked > 0:
-        linspace = torch.linspace(0.0, 1.0, total_masked, device=device)
-        offsets_flat = offsets.reshape(-1).clone()
-        masked_flat = masked.reshape(-1)
-        offsets_flat[masked_flat] = linspace
-        offsets = offsets_flat.view(B, n)
-    keys = masked.to(torch.float32) + offsets
-    return keys.argsort(dim=-1).to(torch.long)
-
-
-def _compute_eso_loss_v2(
-    model: TinyEsoDiT,
-    x0: torch.Tensor,
-    labels: torch.Tensor,
-    cfg: LMConfig,
-    mask_id: int,
-    alpha_0: float = 0.0,
-    shuffle_unmasked: bool = False,
-) -> torch.Tensor:
-    """Full Eso-LM sequential-branch training loss (mirrors the official
-    `_reconstruction_loss`).
-
-    Uses fixed alpha_0 as the mask rate boundary (NOT a sampled t). With
-    prob (1 - alpha_0), each position is masked in zt. Sort so unmasked
-    tokens come first (shuffled or sequential) and masked tokens come last
-    in sequential order. Forward through TinyEsoDiT with block_diff_mask
-    attention over [zt, x0]. Zero-mask trick suppresses mask_id in the head
-    output. Loss is raw NLL (no scheduler weight) at masked positions only.
-    """
-    B, n = x0.shape
-    device = x0.device
-
-    maskable = labels != -100
-
-    # At alpha_0 mask rate: each maskable position is masked independently
-    # with probability (1 - alpha_0). alpha_0 = 0 -> all masked (pure AR),
-    # alpha_0 = 0.5 -> half masked, etc.
-    p_mask = float(1.0 - alpha_0)
-    mask_draw = (torch.rand((B, n), device=device) < p_mask) & maskable
-
-    # Force at least one mask per row that has maskable positions
-    any_maskable = maskable.any(dim=1)
-    any_masked = mask_draw.any(dim=1)
-    need_fix = any_maskable & (~any_masked)
-    if bool(need_fix.any().item()):
-        row_idx = torch.where(need_fix)[0]
-        first_pos = torch.argmax(maskable[row_idx].to(torch.float32), dim=1)
-        mask_draw[row_idx, first_pos] = True
-
-    xt = torch.where(mask_draw, torch.full_like(x0, mask_id), x0)
-
-    sort_idx = _compute_sort_idx(xt, mask_id, shuffle_unmasked=shuffle_unmasked)
-    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, n)
-    zt = xt[batch_idx, sort_idx]
-    x0_sorted = x0[batch_idx, sort_idx]
-
-    logits = model(zt, x0=x0_sorted, sort_idx=sort_idx, mode="sequential")
-    # Zero-mask trick
-    neg_inf = torch.finfo(logits.dtype).min / 2
-    logits = logits.clone()
-    logits[..., mask_id] = neg_inf
-    log_probs = F.log_softmax(logits, dim=-1)
-    nll = -log_probs.gather(-1, x0_sorted.unsqueeze(-1)).squeeze(-1)  # [B, n]
-
-    loss_mask = (zt == mask_id).to(nll.dtype)
-    denom = loss_mask.sum().clamp_min(1.0)
-    return (nll * loss_mask).sum() / denom
-
-
-def _timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10_000) -> torch.Tensor:
-    if t.dim() != 1:
-        raise ValueError(f"Expected 1D timesteps, got shape={tuple(t.shape)}")
-    half = dim // 2
-    if half == 0:
-        return t.unsqueeze(-1)
-    device = t.device
-    freqs = torch.exp(
-        -math.log(float(max_period)) * torch.arange(half, device=device, dtype=torch.float32) / half
-    )
-    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
-    if dim % 2 == 1:
-        emb = F.pad(emb, (0, 1))
-    return emb
-
-
-class TinyDiffusionLM(nn.Module):
-    def __init__(self, vocab_size: int, cfg: LMConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-
-        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model),
-        )
-        layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model,
-            nhead=cfg.n_heads,
-            dim_feedforward=cfg.d_ff,
-            dropout=cfg.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=False,
-        )
-        self.blocks = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
-        self.ln_f = nn.LayerNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
-
-    def forward(self, input_ids: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
-        bsz, seqlen = input_ids.shape
-        if seqlen > self.cfg.max_seq_len:
-            raise ValueError(
-                f"sequence length {seqlen} exceeds max_seq_len={self.cfg.max_seq_len}"
-            )
-        if timesteps is None:
-            timesteps = torch.zeros(bsz, device=input_ids.device, dtype=torch.float32)
-        if timesteps.shape != (bsz,):
-            raise ValueError(f"timesteps shape mismatch: expected {(bsz,)}, got {tuple(timesteps.shape)}")
-
-        pos = torch.arange(seqlen, device=input_ids.device).unsqueeze(0).expand(bsz, seqlen)
-        tok = self.tok_emb(input_ids) + self.pos_emb(pos)
-        t_emb = self.time_mlp(_timestep_embedding(timesteps, self.cfg.d_model)).unsqueeze(1)
-        x = tok + t_emb
-
-        x = self.blocks(x)
-        x = self.ln_f(x)
-        return self.head(x)
-
-
-def _alpha_from_t(t: torch.Tensor, scheduler: str) -> torch.Tensor:
-    sched = (scheduler or "linear").strip().lower()
-    if sched == "linear":
-        return 1.0 - t
-    if sched == "cosine":
-        return 1.0 - torch.cos((math.pi / 2.0) * (1.0 - t))
-    raise ValueError(f"Unsupported diffusion scheduler: {scheduler}")
-
-
-def _alpha_weight_from_t(t: torch.Tensor, scheduler: str) -> torch.Tensor:
-    sched = (scheduler or "linear").strip().lower()
-    if sched == "linear":
-        alpha = _alpha_from_t(t, sched)
-        return torch.ones_like(t) / (1.0 - alpha + 1e-6)
-    if sched == "cosine":
-        z = (math.pi / 2.0) * (1.0 - t)
-        alpha_deriv = -(math.pi / 2.0) * torch.sin(z)
-        alpha = _alpha_from_t(t, sched)
-        return -alpha_deriv / (1.0 - alpha + 1e-6)
-    raise ValueError(f"Unsupported diffusion scheduler: {scheduler}")
-
-
-def _reverse_mask_prob(s: float, t: float, scheduler: str) -> float:
-    s_t = torch.tensor([s], dtype=torch.float32)
-    t_t = torch.tensor([t], dtype=torch.float32)
-    a_s = _alpha_from_t(s_t, scheduler)[0]
-    a_t = _alpha_from_t(t_t, scheduler)[0]
-    out = (1.0 - a_s) / (1.0 - a_t + 1e-8)
-    return float(max(0.0, min(1.0, out.item())))
-
-
-def _get_num_transfer_tokens(
-    mask_index: torch.Tensor,
-    steps: int,
-    scheduler: str,
-    stochastic: bool = False,
-) -> torch.Tensor:
-    mask_num = mask_index.sum(dim=1, keepdim=True).to(dtype=torch.long)
-    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.long)
-
-    for i in range(mask_num.size(0)):
-        for t_step, s_step, j in zip(range(steps, 0, -1), range(steps - 1, -1, -1), range(steps)):
-            s = float(s_step) / float(steps)
-            t = float(t_step) / float(steps)
-            reverse_transfer_prob = 1.0 - _reverse_mask_prob(s=s, t=t, scheduler=scheduler)
-
-            if not stochastic:
-                x = float(mask_num[i, 0].item()) * reverse_transfer_prob
-                k = int(round(x))
-            else:
-                n = int(mask_num[i, 0].item())
-                if n <= 0:
-                    k = 0
-                else:
-                    sample = torch.distributions.Binomial(total_count=n, probs=reverse_transfer_prob).sample()
-                    k = int(sample.item())
-            k = min(k, int(mask_num[i, 0].item()))
-            num_transfer_tokens[i, j] = k
-            mask_num[i, 0] -= k
-            if int(mask_num[i, 0].item()) == 0:
-                break
-
-    rows: List[torch.Tensor] = []
-    max_len = 0
-    for i in range(num_transfer_tokens.size(0)):
-        nonzero = num_transfer_tokens[i][num_transfer_tokens[i] > 0]
-        rows.append(nonzero)
-        max_len = max(max_len, int(nonzero.numel()))
-    if max_len == 0:
-        return torch.zeros((num_transfer_tokens.size(0), 0), dtype=torch.long, device=mask_index.device)
-
-    padded_rows = []
-    for r in rows:
-        if int(r.numel()) < max_len:
-            pad = torch.zeros(max_len - int(r.numel()), dtype=r.dtype, device=r.device)
-            r = torch.cat([r, pad], dim=0)
-        padded_rows.append(r)
-    return torch.stack(padded_rows, dim=0)
-
-
-def _get_num_transfer_tokens_by_budget(
-    mask_index: torch.Tensor,
-    tokens_per_step: int,
-) -> torch.Tensor:
-    budget = max(1, int(tokens_per_step))
-    mask_num = mask_index.sum(dim=1).to(dtype=torch.long)
-    rows: List[torch.Tensor] = []
-    max_len = 0
-    for i in range(mask_num.size(0)):
-        n = int(mask_num[i].item())
-        if n <= 0:
-            row = torch.zeros(0, dtype=torch.long, device=mask_index.device)
-        else:
-            chunks: List[int] = []
-            while n > 0:
-                k = min(budget, n)
-                chunks.append(k)
-                n -= k
-            row = torch.tensor(chunks, dtype=torch.long, device=mask_index.device)
-        rows.append(row)
-        max_len = max(max_len, int(row.numel()))
-    if max_len == 0:
-        return torch.zeros((mask_num.size(0), 0), dtype=torch.long, device=mask_index.device)
-    padded_rows = []
-    for r in rows:
-        if int(r.numel()) < max_len:
-            pad = torch.zeros(max_len - int(r.numel()), dtype=r.dtype, device=r.device)
-            r = torch.cat([r, pad], dim=0)
-        padded_rows.append(r)
-    return torch.stack(padded_rows, dim=0)
-
-
 LMModel = TinyDecoderLM
 
 
@@ -1070,8 +509,8 @@ def _ids_with_special_tokens(tokenized: Sequence[Sequence[str]], vocab: TokenVoc
 
 def _normalize_model_type(model_type: str) -> str:
     mt = (model_type or "decoder").strip().lower()
-    if mt not in {"decoder", "diffusion", "ao_gpt", "ao_gpt_pp", "eso", "eso_v2", "llama"}:
-        raise ValueError(f"Unsupported model_type: {model_type}. Expected one of: decoder, diffusion, ao_gpt, ao_gpt_pp, eso, eso_v2, llama")
+    if mt not in {"decoder", "ao_gpt", "ao_gpt_pp"}:
+        raise ValueError(f"Unsupported model_type: {model_type}. Expected one of: decoder, ao_gpt, ao_gpt_pp")
     return mt
 
 
@@ -1258,140 +697,6 @@ def _compute_ao_gpt_pp_loss(
     return loss
 
 
-def _compute_diffusion_loss(
-    model: TinyDecoderLM,
-    clean_ids: torch.Tensor,
-    labels: torch.Tensor,
-    cfg: LMConfig,
-    mask_id: int,
-    structural_ids: Optional[set] = None,
-) -> torch.Tensor:
-    """Masked diffusion loss with chemical-role-aware noise scheduling.
-
-    When *structural_ids* is provided, each position gets a per-role
-    noise exponent: structural tokens (exp=1.5) are masked last,
-    motif tokens (exp=0.5) are masked first.  This turns the continuous
-    diffusion into a chemistry-aware curriculum.
-    """
-    bsz, seqlen = clean_ids.shape
-    maskable_mask = labels != -100
-    t = cfg.diffusion_time_epsilon + (1.0 - cfg.diffusion_time_epsilon) * torch.rand(
-        bsz, device=clean_ids.device
-    )
-
-    if structural_ids:
-        is_struct = torch.zeros((bsz, seqlen), device=clean_ids.device, dtype=torch.bool)
-        for sid in structural_ids:
-            is_struct |= (clean_ids == sid)
-        role_exp = torch.where(is_struct, 1.5, 0.5).to(dtype=torch.float32, device=clean_ids.device)
-        p_mask = t.unsqueeze(1).expand(bsz, seqlen).pow(role_exp)
-        masked_mask = (torch.rand((bsz, seqlen), device=clean_ids.device) < p_mask) & maskable_mask
-    else:
-        p_mask = 1.0 - _alpha_from_t(t, scheduler=cfg.diffusion_scheduler)
-        masked_mask = (torch.rand((bsz, seqlen), device=clean_ids.device) < p_mask.unsqueeze(1)) & maskable_mask
-
-    if not bool(masked_mask.any().item()):
-        any_maskable = maskable_mask.any(dim=1)
-        if bool(any_maskable.any().item()):
-            row_idx = torch.where(any_maskable)[0]
-            first_pos = torch.argmax(maskable_mask[row_idx].to(dtype=torch.float32), dim=1)
-            masked_mask[row_idx, first_pos] = True
-
-    noised_ids = torch.where(masked_mask, torch.full_like(clean_ids, mask_id), clean_ids)
-    logits = model(noised_ids)
-    token_nll = F.cross_entropy(logits.transpose(1, 2), clean_ids, reduction="none")
-
-    if structural_ids:
-        role_exp_t = torch.where(is_struct, 1.5, 0.5).to(dtype=torch.float32, device=clean_ids.device)
-        alpha_vals = 1.0 - t.unsqueeze(1).expand(bsz, seqlen).pow(role_exp_t)
-        loss_weights = 1.0 / (1.0 - alpha_vals + 1e-5)
-    else:
-        weight_mode = (cfg.diffusion_loss_weight or "scheduler").strip().lower()
-        if weight_mode == "scheduler":
-            loss_weights = _alpha_weight_from_t(t, scheduler=cfg.diffusion_scheduler).unsqueeze(1).expand_as(token_nll)
-        elif weight_mode == "uniform":
-            loss_weights = torch.ones_like(token_nll)
-        else:
-            raise ValueError(f"Unsupported diffusion_loss_weight: {cfg.diffusion_loss_weight}")
-
-    token_nll = token_nll * masked_mask.to(dtype=token_nll.dtype) * loss_weights
-    return token_nll.sum() / masked_mask.sum().clamp_min(1)
-
-
-def _compute_eso_loss(
-    model: TinyDecoderLM,
-    clean_ids: torch.Tensor,
-    labels: torch.Tensor,
-    cfg: LMConfig,
-    mask_id: int,
-    random_ratio: float = 0.9,
-    ar_frac: float = 0.5,
-) -> torch.Tensor:
-    """Eso-LM loss mixing AR (alpha_0=0) and MDM (alpha_0=1) per batch.
-
-    With probability ``ar_frac``, runs the AO-GPT objective (next-token CE on
-    clean tokens along a random order -- equivalent to Eso-LM at alpha_0=0).
-    Otherwise runs the MDM-under-shuffled-causal objective: sample a random
-    time t, mask some positions, predict masked tokens from causal predecessors
-    in the shuffled order, weighted by ``alpha'_t / (1 - alpha_t)``.
-
-    The AR branch is equivalent to AO-GPT on the same data; mixing both
-    regimes lets the shared TinyDecoderLM handle alpha_0 continuously at
-    inference time.
-    """
-    bsz, seqlen = clean_ids.shape
-    device = clean_ids.device
-
-    do_ar = (ar_frac >= 1.0) or (ar_frac > 0.0 and bool(torch.rand(1, device=device).item() < ar_frac))
-    orders = _sample_ao_orders(labels, random_ratio=random_ratio)
-    batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, seqlen)
-
-    if do_ar:
-        logits = model(clean_ids, orders=orders)
-        targets_shuf = labels[batch_idx, orders]
-        return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            targets_shuf.reshape(-1),
-            ignore_index=-100,
-        )
-
-    # MDM branch
-    maskable_mask = labels != -100
-    t = cfg.diffusion_time_epsilon + (1.0 - cfg.diffusion_time_epsilon) * torch.rand(
-        bsz, device=device
-    )
-    p_mask = 1.0 - _alpha_from_t(t, scheduler=cfg.diffusion_scheduler)
-    masked_mask = (
-        torch.rand((bsz, seqlen), device=device) < p_mask.unsqueeze(1)
-    ) & maskable_mask
-
-    if not bool(masked_mask.any().item()):
-        any_maskable = maskable_mask.any(dim=1)
-        if bool(any_maskable.any().item()):
-            row_idx = torch.where(any_maskable)[0]
-            first_pos = torch.argmax(
-                maskable_mask[row_idx].to(dtype=torch.float32), dim=1
-            )
-            masked_mask[row_idx, first_pos] = True
-
-    noised_ids = torch.where(masked_mask, torch.full_like(clean_ids, mask_id), clean_ids)
-    logits = model(noised_ids, orders=orders)
-    targets_shuf = clean_ids[batch_idx, orders]
-    masked_shuf = masked_mask[batch_idx, orders]
-    token_nll = F.cross_entropy(logits.transpose(1, 2), targets_shuf, reduction="none")
-
-    weight_mode = (cfg.diffusion_loss_weight or "scheduler").strip().lower()
-    if weight_mode == "scheduler":
-        loss_weights = _alpha_weight_from_t(t, scheduler=cfg.diffusion_scheduler).unsqueeze(1).expand_as(token_nll)
-    elif weight_mode == "uniform":
-        loss_weights = torch.ones_like(token_nll)
-    else:
-        raise ValueError(f"Unsupported diffusion_loss_weight: {cfg.diffusion_loss_weight}")
-
-    token_nll = token_nll * masked_shuf.to(dtype=token_nll.dtype) * loss_weights
-    return token_nll.sum() / masked_shuf.sum().clamp_min(1)
-
-
 def train_language_model(
     train_smiles: Sequence[str],
     valid_smiles: Sequence[str],
@@ -1421,10 +726,6 @@ def train_language_model(
     cfg = cfg or LMConfig()
     model_type = _normalize_model_type(cfg.model_type)
     cfg.model_type = model_type
-    if not (0.0 < float(cfg.diffusion_time_epsilon) < 1.0):
-        raise ValueError("diffusion_time_epsilon must be in (0, 1).")
-    if int(cfg.diffusion_steps) <= 0:
-        raise ValueError("diffusion_steps must be >= 1.")
 
     _set_seed(cfg.seed)
     dev = _resolve_torch_device(device)
@@ -1485,18 +786,14 @@ def train_language_model(
     vocab = TokenVocab.build(
         vocab_fit_tok,
         min_freq=min_token_freq,
-        add_mask_token=(model_type == "diffusion"),
+        add_mask_token=False,
         seed_tokens=motif_seed,
     )
 
     train_ids = _ids_with_special_tokens(train_tok, vocab)
     valid_ids = _ids_with_special_tokens(valid_tok, vocab)
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
-        ds_train: Dataset[Any] = NextTokenDataset(train_ids, cfg.max_seq_len, vocab.pad_id)
-        ds_valid: Dataset[Any] = NextTokenDataset(valid_ids, cfg.max_seq_len, vocab.pad_id)
-    else:
-        ds_train = DenoiseDataset(train_ids, cfg.max_seq_len)
-        ds_valid = DenoiseDataset(valid_ids, cfg.max_seq_len)
+    ds_train: Dataset[Any] = NextTokenDataset(train_ids, cfg.max_seq_len, vocab.pad_id)
+    ds_valid: Dataset[Any] = NextTokenDataset(valid_ids, cfg.max_seq_len, vocab.pad_id)
 
     if len(ds_train) == 0:
         raise ValueError("Training dataset is empty after tokenization/padding.")
@@ -1510,16 +807,10 @@ def train_language_model(
             pass
     use_amp, amp_dtype, use_scaler, amp_label = _resolve_amp_mode(cfg.amp, dev)
 
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
-        collate_fn = build_dynamic_lm_collate_fn(
-            vocab.pad_id,
-            pad_to_multiple_of=(8 if dev.type == "cuda" else None),
-        )
-    else:
-        collate_fn = build_dynamic_denoise_collate_fn(
-            vocab.pad_id,
-            pad_to_multiple_of=(8 if dev.type == "cuda" else None),
-        )
+    collate_fn = build_dynamic_lm_collate_fn(
+        vocab.pad_id,
+        pad_to_multiple_of=(8 if dev.type == "cuda" else None),
+    )
     pin_memory = dev.type == "cuda"
     train_loader_kwargs: Dict[str, Any] = {
         "batch_size": cfg.batch_size,
@@ -1548,14 +839,7 @@ def train_language_model(
     loader_train = DataLoader(ds_train, **train_loader_kwargs)
     loader_valid = DataLoader(ds_valid, **valid_loader_kwargs)
 
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
-        model: LMModel = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
-    else:
-        # Standard MDLM denoiser: bidirectional attention, no AdaLN/target-pos
-        # conditioning, no none_emb prefix. Force cfg.use_adaln=False so the
-        # arch matches standard MDM transformers.
-        cfg.use_adaln = False
-        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=True)
+    model: LMModel = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
 
     if init_from is not None:
         init_path = Path(init_from) / "model.pt"
@@ -1596,12 +880,8 @@ def train_language_model(
         f"num_data_workers={max(0, int(cfg.num_data_workers))}, prefetch_factor={max(2, int(cfg.prefetch_factor))}",
         flush=True,
     )
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
-        train_effective_max_seq_len = max((len(x) for x, _ in ds_train.samples), default=0)  # type: ignore[attr-defined]
-        valid_effective_max_seq_len = max((len(x) for x, _ in ds_valid.samples), default=0)  # type: ignore[attr-defined]
-    else:
-        train_effective_max_seq_len = max((len(x) for x in ds_train.samples), default=0)  # type: ignore[attr-defined]
-        valid_effective_max_seq_len = max((len(x) for x in ds_valid.samples), default=0)  # type: ignore[attr-defined]
+    train_effective_max_seq_len = max((len(x) for x, _ in ds_train.samples), default=0)  # type: ignore[attr-defined]
+    valid_effective_max_seq_len = max((len(x) for x, _ in ds_valid.samples), default=0)  # type: ignore[attr-defined]
     print(
         f"[train-lm] dynamic_padding=batch_max (cfg_max_seq_len={cfg.max_seq_len}, "
         f"train_effective_max_seq_len={train_effective_max_seq_len}, "
@@ -1609,15 +889,6 @@ def train_language_model(
         flush=True,
     )
     print(f"[train-lm] model_type={model_type}", flush=True)
-    if model_type == "diffusion":
-        print(
-            "[train-lm] diffusion_cfg="
-            f"steps={int(cfg.diffusion_steps)}, scheduler={cfg.diffusion_scheduler}, "
-            f"time_epsilon={float(cfg.diffusion_time_epsilon):.4g}, "
-            f"loss_weight={cfg.diffusion_loss_weight}, "
-            f"tokens_per_step={int(getattr(cfg, 'diffusion_tokens_per_step', 0))}",
-            flush=True,
-        )
 
     adamw_kwargs: Dict[str, Any] = {
         "lr": cfg.lr,
@@ -1638,15 +909,6 @@ def train_language_model(
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)  # pragma: no cover
     non_blocking = dev.type == "cuda"
-
-    # Pre-compute structural token IDs for role-aware masking (diffusion only).
-    _structural_ids: set = set()
-    if model_type == "diffusion" and bool(getattr(cfg, "diffusion_chemical_role_masking", False)):
-        for tok_str, tok_id in vocab.stoi.items():
-            if TokenVocab._is_stamp_structural(tok_str):
-                _structural_ids.add(tok_id)
-        if _structural_ids:
-            print(f"[train-lm] chemical-role masking: {len(_structural_ids)} structural token IDs (exp=1.5), rest motif (exp=0.5)", flush=True)
 
     # Pre-compute topology token ID tensor for ao_gpt_pp type-aware masking.
     _topology_id_tensor = torch.empty(0, dtype=torch.long, device=dev)
@@ -1691,15 +953,6 @@ def train_language_model(
                     loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=cfg.ao_random_ratio)
                 elif model_type == "ao_gpt_pp":
                     loss = _compute_ao_gpt_pp_loss(model, x, y, cfg, _topology_id_tensor)
-                else:
-                    loss = _compute_diffusion_loss(
-                        model,  # type: ignore[arg-type]
-                        clean_ids=x,
-                        labels=y,
-                        cfg=cfg,
-                        mask_id=vocab.mask_id,
-                        structural_ids=_structural_ids if _structural_ids else None,
-                    )
 
             if use_scaler:
                 scaler.scale(loss).backward()
@@ -1732,15 +985,6 @@ def train_language_model(
                         loss = _compute_ao_gpt_loss(model, x, y, cfg, random_ratio=cfg.ao_random_ratio)
                     elif model_type == "ao_gpt_pp":
                         loss = _compute_ao_gpt_pp_loss(model, x, y, cfg, _topology_id_tensor)
-                    else:
-                        loss = _compute_diffusion_loss(
-                            model,  # type: ignore[arg-type]
-                            clean_ids=x,
-                            labels=y,
-                            cfg=cfg,
-                            mask_id=vocab.mask_id,
-                            structural_ids=_structural_ids if _structural_ids else None,
-                        )
                 valid_losses.append(float(loss.item()))
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
@@ -1824,7 +1068,7 @@ def load_trained_model(
     vocab_path = Path(model_dir) / "vocab.json"
 
     ckpt = torch.load(model_path, map_location="cpu")
-    cfg = LMConfig(**ckpt["cfg"])
+    cfg = LMConfig.from_dict(ckpt["cfg"])
     model_type = _normalize_model_type(str(ckpt.get("model_type", cfg.model_type)))
     cfg.model_type = model_type
     rep_name = ckpt["representation"]
@@ -1838,16 +1082,8 @@ def load_trained_model(
 
         cfg.model_type = "decoder"
         model = ControlledDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
-    elif model_type == "llama":
-        model: LMModel = LlamaDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
-    elif model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
-        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
     else:
-        # Standard MDLM denoiser: bidirectional attention, no AdaLN/target-pos
-        # conditioning, no none_emb prefix. Force cfg.use_adaln=False so the
-        # arch matches standard MDM transformers.
-        cfg.use_adaln = False
-        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=True)
+        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
     model.load_state_dict(state_dict)
 
     dev = _resolve_torch_device(device)
@@ -1925,85 +1161,6 @@ def _apply_top_k_logits(logits: torch.Tensor, top_k: int) -> torch.Tensor:
     v, _ = torch.topk(logits, k=k, dim=-1)
     cutoff = v[..., -1:].expand_as(logits)
     return torch.where(logits < cutoff, torch.full_like(logits, float("-inf")), logits)
-
-
-def _stamp_token_id_groups(vocab: TokenVocab) -> Dict[str, List[int]]:
-    joint_ids: List[int] = []
-    branch_ids: List[int] = []
-    stereo_ids: List[int] = []
-    ring_ids: List[int] = []
-    motif_ids: List[int] = []
-    special_ids = {vocab.pad_id, vocab.bos_id, vocab.eos_id, vocab.mask_id, vocab.unk_id}
-    for tok, tok_id in vocab.stoi.items():
-        if tok_id in special_ids:
-            continue
-        if tok.startswith("[J_"):
-            joint_ids.append(int(tok_id))
-        elif tok.startswith("[B_"):
-            branch_ids.append(int(tok_id))
-        elif tok.startswith("[S_"):
-            stereo_ids.append(int(tok_id))
-        elif tok == "[Ring]":
-            ring_ids.append(int(tok_id))
-        else:
-            motif_ids.append(int(tok_id))
-    return {
-        "joint_ids": joint_ids,
-        "branch_ids": branch_ids,
-        "stereo_ids": stereo_ids,
-        "ring_ids": ring_ids,
-        "motif_ids": motif_ids,
-    }
-
-
-def _apply_stamp_structure_constraints(
-    logits: torch.Tensor,
-    current_ids: torch.Tensor,
-    vocab: TokenVocab,
-) -> torch.Tensor:
-    groups = _stamp_token_id_groups(vocab)
-    joint_ids = groups["joint_ids"]
-    branch_ids = groups["branch_ids"]
-    stereo_ids = groups["stereo_ids"]
-    ring_ids = groups["ring_ids"]
-    motif_ids = groups["motif_ids"]
-    if not (joint_ids or branch_ids or stereo_ids or ring_ids):
-        return logits
-
-    prev_ids = torch.full_like(current_ids, vocab.bos_id)
-    prev_ids[:, 1:] = current_ids[:, :-1]
-
-    allowed_joint_prev = torch.zeros_like(current_ids, dtype=torch.bool)
-    allowed_stereo_prev = torch.zeros_like(current_ids, dtype=torch.bool)
-    allowed_ring_prev = torch.zeros_like(current_ids, dtype=torch.bool)
-    allowed_branch_prev = torch.zeros_like(current_ids, dtype=torch.bool)
-
-    for tok_id in motif_ids:
-        allowed_joint_prev |= (prev_ids == int(tok_id))
-    for tok_id in joint_ids:
-        allowed_joint_prev |= (prev_ids == int(tok_id))
-        allowed_stereo_prev |= (prev_ids == int(tok_id))
-        allowed_ring_prev |= (prev_ids == int(tok_id))
-        allowed_branch_prev |= (prev_ids == int(tok_id))
-    for tok_id in stereo_ids:
-        allowed_joint_prev |= (prev_ids == int(tok_id))
-        allowed_ring_prev |= (prev_ids == int(tok_id))
-        allowed_branch_prev |= (prev_ids == int(tok_id))
-    for tok_id in ring_ids:
-        allowed_joint_prev |= (prev_ids == int(tok_id))
-        allowed_branch_prev |= (prev_ids == int(tok_id))
-
-    if joint_ids:
-        logits[:, :, joint_ids] = logits[:, :, joint_ids].masked_fill((~allowed_joint_prev).unsqueeze(-1), float("-inf"))
-    if stereo_ids:
-        logits[:, :, stereo_ids] = logits[:, :, stereo_ids].masked_fill((~allowed_stereo_prev).unsqueeze(-1), float("-inf"))
-    if ring_ids:
-        logits[:, :, ring_ids] = logits[:, :, ring_ids].masked_fill((~allowed_ring_prev).unsqueeze(-1), float("-inf"))
-    if branch_ids:
-        invalid_branch = ~allowed_branch_prev
-        invalid_branch[:, -1] = True
-        logits[:, :, branch_ids] = logits[:, :, branch_ids].masked_fill(invalid_branch.unsqueeze(-1), float("-inf"))
-    return logits
 
 
 def _add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -2251,139 +1408,6 @@ def _sample_model_sequences_ao_canvas_confidence(
     return out
 
 
-def _sample_model_sequences_diffusion(
-    model: TinyDecoderLM,
-    vocab: TokenVocab,
-    n_samples: int,
-    max_new_tokens: int = 256,
-    temperature: float = 1.0,
-    top_k: int = 50,
-    prompt_tokens: Optional[Sequence[str]] = None,
-    device: Optional[torch.device] = None,
-    diffusion_steps: Optional[int] = None,
-    diffusion_tokens_per_step: Optional[int] = None,
-    diffusion_block_size: Optional[int] = None,
-    diffusion_remasking: Optional[str] = None,
-    diffusion_stochastic_transfer: Optional[bool] = None,
-) -> List[List[str]]:
-    if n_samples <= 0:
-        return []
-    if vocab.mask_id == vocab.unk_id and TokenVocab.MASK not in vocab.stoi:
-        raise ValueError(
-            "Diffusion sampling requires a vocab with <mask> token. Please retrain with --model-type diffusion."
-        )
-
-    dev = device or next(model.parameters()).device
-    prompt_ids = vocab.encode_tokens(list(prompt_tokens or []))
-    prefix = [vocab.bos_id] + prompt_ids
-    prefix = prefix[: model.cfg.max_seq_len]
-    if len(prefix) >= model.cfg.max_seq_len:
-        max_new_tokens = 0
-    else:
-        max_new_tokens = min(max_new_tokens, model.cfg.max_seq_len - len(prefix))
-
-    total_len = len(prefix) + max_new_tokens
-    if total_len <= 0:
-        return [[] for _ in range(n_samples)]
-
-    x = torch.full((n_samples, total_len), vocab.pad_id, dtype=torch.long, device=dev)
-    x[:, : len(prefix)] = torch.tensor(prefix, dtype=torch.long, device=dev).unsqueeze(0).repeat(n_samples, 1)
-    if max_new_tokens > 0:
-        x[:, len(prefix) :] = vocab.mask_id
-
-    steps = max(1, int(diffusion_steps if diffusion_steps is not None else model.cfg.diffusion_steps))
-    tokens_per_step = int(
-        diffusion_tokens_per_step
-        if diffusion_tokens_per_step is not None
-        else getattr(model.cfg, "diffusion_tokens_per_step", 0)
-    )
-    block_size = diffusion_block_size if diffusion_block_size is not None else model.cfg.diffusion_block_size
-    if block_size is None or int(block_size) <= 0:
-        block_size = max(1, max_new_tokens)
-    block_size = max(1, int(block_size))
-    remasking = (diffusion_remasking or model.cfg.diffusion_remasking or "low_confidence").strip().lower()
-    stochastic_transfer = bool(
-        model.cfg.diffusion_stochastic_transfer
-        if diffusion_stochastic_transfer is None
-        else diffusion_stochastic_transfer
-    )
-
-    if max_new_tokens > 0:
-        num_blocks = int(math.ceil(max_new_tokens / block_size))
-        steps_per_block = int(math.ceil(steps / num_blocks))
-
-        for b in range(num_blocks):
-            start = len(prefix) + b * block_size
-            end = min(start + block_size, total_len)
-            block_mask_index = x[:, start:end] == vocab.mask_id
-            if tokens_per_step > 0:
-                num_transfer_tokens = _get_num_transfer_tokens_by_budget(
-                    mask_index=block_mask_index,
-                    tokens_per_step=tokens_per_step,
-                )
-            else:
-                num_transfer_tokens = _get_num_transfer_tokens(
-                    mask_index=block_mask_index,
-                    steps=steps_per_block,
-                    scheduler=model.cfg.diffusion_scheduler,
-                    stochastic=stochastic_transfer,
-                )
-            effective_steps = int(num_transfer_tokens.size(1))
-            for i in range(effective_steps):
-                mask_index = x == vocab.mask_id
-                if not bool(mask_index.any().item()):
-                    break
-                with torch.no_grad():
-                    logits = model(x)
-                # Allow EOS (model must learn to terminate sequences). Still
-                # suppress PAD/BOS/MASK/UNK which are never valid outputs.
-                for suppressed_id in (vocab.pad_id, vocab.bos_id, vocab.mask_id, vocab.unk_id):
-                    if 0 <= int(suppressed_id) < logits.size(-1):
-                        logits[:, :, suppressed_id] = float("-inf")
-                if bool(getattr(model.cfg, "diffusion_structure_constraints", False)):
-                    logits = _apply_stamp_structure_constraints(logits, current_ids=x, vocab=vocab)
-                logits = _apply_top_k_logits(logits, top_k=top_k)
-                logits_for_decode = _add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_for_decode, dim=-1).to(dtype=torch.long)
-
-                if remasking == "low_confidence":
-                    p = torch.softmax(logits, dim=-1)
-                    x0_conf = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
-                elif remasking == "random":
-                    x0_conf = torch.rand((n_samples, total_len), device=dev)
-                else:
-                    raise ValueError(
-                        f"Unsupported diffusion_remasking: {remasking}. Expected low_confidence|random."
-                    )
-
-                x0 = torch.where(mask_index, x0, x)
-                conf = torch.where(mask_index, x0_conf, torch.full_like(x0_conf, float("-inf")))
-                conf[:, :start] = float("-inf")
-                conf[:, end:] = float("-inf")
-
-                ks = num_transfer_tokens[:, i].clamp(min=0)
-                max_k = int(ks.max().item())
-                if max_k > 0:
-                    _, topk_idx = torch.topk(conf, k=max_k, dim=-1)
-                    arange_k = torch.arange(max_k, device=conf.device).unsqueeze(0)
-                    transfer_index = arange_k < ks.unsqueeze(1)
-                    scatter_mask = torch.zeros_like(mask_index, dtype=torch.bool)
-                    scatter_mask.scatter_(1, topk_idx, transfer_index)
-                    transfer_index = scatter_mask
-                else:
-                    transfer_index = torch.zeros_like(mask_index, dtype=torch.bool)
-
-                x[transfer_index] = x0[transfer_index]
-
-    x = torch.where(x == vocab.mask_id, torch.full_like(x, vocab.pad_id), x)
-    out: List[List[str]] = []
-    all_ids = x[:, 1:].detach().cpu().tolist()
-    for row in all_ids:
-        row = _trim_special_tail(row, vocab)
-        out.append(vocab.decode_ids(row))
-    return out
-
-
 def sample_model_sequences(
     model: LMModel,
     vocab: TokenVocab,
@@ -2395,52 +1419,31 @@ def sample_model_sequences(
     typical_p: float = 0.0,
     prompt_tokens: Optional[Sequence[str]] = None,
     device: Optional[torch.device] = None,
-    diffusion_steps: Optional[int] = None,
-    diffusion_tokens_per_step: Optional[int] = None,
-    diffusion_block_size: Optional[int] = None,
-    diffusion_remasking: Optional[str] = None,
-    diffusion_stochastic_transfer: Optional[bool] = None,
     ao_decode_mode: str = "ar",
     ao_canvas_placeholder: str = "unk",
 ) -> List[List[str]]:
     model_type = _normalize_model_type(getattr(model.cfg, "model_type", "decoder"))
-    if model_type in ("decoder", "ao_gpt", "ao_gpt_pp", "llama"):
-        if model_type in ("ao_gpt", "ao_gpt_pp") and str(ao_decode_mode).strip().lower() == "ao_canvas_confidence":
-            return _sample_model_sequences_ao_canvas_confidence(
-                model=model,  # type: ignore[arg-type]
-                vocab=vocab,
-                n_samples=n_samples,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                prompt_tokens=prompt_tokens,
-                device=device,
-                placeholder_token=ao_canvas_placeholder,
-            )
-        return _sample_model_sequences_decoder(
-            model=model,  # type: ignore[arg-type]
+    if model_type in ("ao_gpt", "ao_gpt_pp") and str(ao_decode_mode).strip().lower() == "ao_canvas_confidence":
+        return _sample_model_sequences_ao_canvas_confidence(
+            model=model,
             vocab=vocab,
             n_samples=n_samples,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
-            top_p=top_p,
-            typical_p=typical_p,
             prompt_tokens=prompt_tokens,
             device=device,
+            placeholder_token=ao_canvas_placeholder,
         )
-    return _sample_model_sequences_diffusion(
-        model=model,  # type: ignore[arg-type]
+    return _sample_model_sequences_decoder(
+        model=model,
         vocab=vocab,
         n_samples=n_samples,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
+        top_p=top_p,
+        typical_p=typical_p,
         prompt_tokens=prompt_tokens,
         device=device,
-        diffusion_steps=diffusion_steps,
-        diffusion_tokens_per_step=diffusion_tokens_per_step,
-        diffusion_block_size=diffusion_block_size,
-        diffusion_remasking=diffusion_remasking,
-        diffusion_stochastic_transfer=diffusion_stochastic_transfer,
     )

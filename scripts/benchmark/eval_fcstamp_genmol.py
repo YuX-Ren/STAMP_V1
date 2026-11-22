@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
 
 from stamp.benchmark.common import canonicalize_smiles  # noqa: E402
 from stamp.benchmark.hybrid_vocab import HybridVocab, is_fcstamp_control_token, is_stamp_structural  # noqa: E402
-from stamp.benchmark.lm import LMConfig, LlamaDecoderLM, TinyDecoderLM, TokenVocab, _resolve_torch_device, _sample_next_tokens  # noqa: E402
+from stamp.benchmark.lm import LMConfig, TinyDecoderLM, TokenVocab, _resolve_torch_device, _sample_next_tokens  # noqa: E402
 from stamp.benchmark.metrics import _internal_diversity, _load_sa_scorer  # noqa: E402
 from stamp.benchmark.representations import build_representation  # noqa: E402
 
@@ -62,14 +62,11 @@ def _load_vocab(path: Path) -> Any:
 def _load_model(model_dir: str | Path, device: str) -> tuple[torch.nn.Module, Any, Any, torch.device]:
     model_dir = Path(model_dir)
     ckpt = torch.load(model_dir / "model.pt", map_location="cpu")
-    cfg = LMConfig(**ckpt["cfg"])
+    cfg = LMConfig.from_dict(ckpt["cfg"])
     model_type = str(ckpt.get("model_type", cfg.model_type)).strip().lower()
     cfg.model_type = model_type
     vocab = _load_vocab(model_dir / "vocab.json")
-    if model_type == "llama":
-        model = LlamaDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
-    else:
-        model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
+    model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
     state = ckpt["model_state"]
     if any(k.startswith("_orig_mod.") for k in state):
         state = {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v for k, v in state.items()}
