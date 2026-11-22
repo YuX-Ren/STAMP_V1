@@ -23,8 +23,8 @@ selected directory, including its vocabulary and configuration files.
 | `scaffold_decoration` | Scaffold decoration | `model.pt` | Additional task adaptation, 10 epochs |
 | `encoder_mlm` | Molecular embeddings and supervised property fine-tuning | `pretrained_roberta.pt` | PubChem MLM, final epoch 10 |
 | `encoder_mtr` | Molecular embeddings and supervised property fine-tuning | `pretrained_roberta.pt` | PubChem descriptor regression, best validation checkpoint |
-| `molt5_mol2text_from350k` | Molecular captioning | `model.safetensors` | Earlier ChEBI-20 adaptation from 350k |
-| `molt5_text2mol_from350k` | Text-conditioned molecular generation | `model.safetensors` | Earlier ChEBI-20 adaptation from 350k |
+| `molt5_mol2text_valid_best` | Molecular captioning | `model.safetensors` | Best-validation ChEBI-20 adaptation; 350k parent |
+| `molt5_text2mol_valid_best` | Text-conditioned molecular generation | `model.safetensors` | Best-validation ChEBI-20 adaptation; 350k parent |
 | `controlled_stamp` | Controlled stamp generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
 | `controlled_smiles` | Controlled smiles generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
 | `controlled_selfies` | Controlled selfies generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
@@ -243,8 +243,8 @@ defaults to linear decay after warm-up.
 
 | Downstream checkpoint | Saved epoch | Saved step | Validation loss |
 | --- | ---: | ---: | ---: |
-| `molt5_mol2text_from350k` | 13 | 11,500 | 0.550620 |
-| `molt5_text2mol_from350k` | 13 | 11,500 | 0.554479 |
+| `molt5_mol2text_valid_best` | 13 | 11,500 | 0.550620 |
+| `molt5_text2mol_valid_best` | 13 | 11,500 | 0.554479 |
 
 ## Evaluation results
 
@@ -280,11 +280,11 @@ STAMP before scoring; validity and exact match below are percentages.
 
 | Captioning checkpoint | BLEU-2 | BLEU-4 | METEOR | ROUGE-L |
 | --- | ---: | ---: | ---: | ---: |
-| From 350k | 0.511805 | 0.422907 | 0.550187 | 0.566299 |
+| `molt5_mol2text_valid_best` | 0.511805 | 0.422907 | 0.550187 | 0.566299 |
 
 | Text-to-molecule checkpoint | Validity, % | Exact match, % | MACCS similarity | Morgan similarity |
 | --- | ---: | ---: | ---: | ---: |
-| From 350k | 97.5455 | 10.5455 | 0.774475 | 0.538839 |
+| `molt5_text2mol_valid_best` | 97.5455 | 10.5455 | 0.774475 | 0.538839 |
 
 Each downstream model directory includes `evaluation_metrics.json` with its
 full archived metric record from `eval_test_v2`. Both released MolT5 models

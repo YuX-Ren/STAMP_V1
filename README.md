@@ -103,7 +103,7 @@ Pretrained weights and companion vocabularies/configurations are available on
 | Linker, motif extension, superstructure | `fragment_infill` |
 | Scaffold decoration | `scaffold_decoration` |
 | Property learning | `encoder_mlm`, `encoder_mtr` |
-| Molecule–text translation | `molt5_mol2text_from350k`, `molt5_text2mol_from350k` |
+| Molecule–text translation | `molt5_mol2text_valid_best`, `molt5_text2mol_valid_best` |
 
 Download the generation models:
 
@@ -169,12 +169,12 @@ parquet (`text2mol_source`, `text2mol_target`, `smiles` columns):
 
 ```bash
 python -m pip install -r envs/requirements-translation.txt
-hf download bi0s/STAMP_V1 --include 'molt5_text2mol_from350k/*' --local-dir checkpoints
+hf download bi0s/STAMP_V1 --include 'molt5_text2mol_valid_best/*' --local-dir checkpoints
 hf download bi0s/STAMP_V1-data main/data/chebi20/finetune_zinc_curated30k/test.parquet \
   --repo-type dataset --local-dir datasets
 python scripts/benchmark/eval_molt5_chebi20.py \
-  --ckpt-dir checkpoints/molt5_text2mol_from350k \
-  --stamp-vocab checkpoints/molt5_text2mol_from350k/motif_vocab.txt \
+  --ckpt-dir checkpoints/molt5_text2mol_valid_best \
+  --stamp-vocab checkpoints/molt5_text2mol_valid_best/motif_vocab.txt \
   --test-parquet datasets/main/data/chebi20/finetune_zinc_curated30k/test.parquet --direction text2mol \
   --num-beams 5 --max-new-tokens 256 --batch-size 32 --device cuda \
   --output-dir results/text2mol
