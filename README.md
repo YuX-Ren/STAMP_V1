@@ -32,6 +32,10 @@ Download the archived [de novo results](assets/results/denovo.json),
 [fragment-task summary](assets/results/fragment_generation.tsv) and
 [per-seed results](assets/results/fragment_generation_per_seed.tsv).
 
+Archived PMO outputs include [per-task scores and best SMILES](assets/results/pmo.csv)
+and [23 corresponding molecules (SDF)](assets/results/pmo_molecules.sdf).
+Celecoxib rediscovery records AUC-Top-10 **0.892777** over **10,000 calls**.
+
 ## Requirements and installation
 
 The CPU demo was tested on RHEL 9.8 (x86-64), Python 3.12.12,
@@ -210,8 +214,8 @@ cp -n datasets/main/data/pmo/oracle/*.pkl oracle/
 PYTHONHASHSEED=0 python scripts/benchmark/run_pmo_baseline.py \
   --model-dir checkpoints/ao_generation \
   --vocab-dir datasets/main/data/pmo/fragment_vocab \
-  --task qed --seed 1 --device cpu --threads 1 \
-  --output results/pmo/qed/s1.json
+  --task qed --device cpu --threads 1 \
+  --output results/pmo/qed/results.json
 ```
 
 Use any task name from `PMO_TASKS` in
@@ -219,11 +223,6 @@ Use any task name from `PMO_TASKS` in
 Outputs are the result JSON, `.meta.json` provenance and `.oracle.jsonl` trace.
 Existing run artifacts are never overwritten.
 
-The [archived per-task score table](assets/results/pmo_training_per_task.csv)
-contains 23 tasks and seeds 1–2. For `x4_init_delta2`, celecoxib rediscovery
-(seed 1) records AUC-Top-10 **0.892777** over **10,000 calls**; the selected
-mean SUM_23 is **18.644572**. These archived scores use a different checkpoint
-and search profile from the default 112M command above.
 
 ## Code layout
 
