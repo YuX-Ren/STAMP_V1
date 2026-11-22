@@ -1,5 +1,5 @@
 {
-  "name": "stamp_pmo_no_surrogate_no_niching_v2",
+  "name": "stamp_pmo",
   "oracle_budget": 10000,
   "generator": {
     "temperature": 0.9,
@@ -25,9 +25,6 @@
     "gp_max_tries": 3,
     "gp_match_mode": "port_sig",
     "gp_n_swaps": 1,
-    "use_scaffold_niching": false,
-    "use_surrogate": false,
-    "surrogate_k_candidates": 1,
     "target_aware": false,
     "tree_crossover_prob": 0.0,
     "novelty_weight": 0.0,

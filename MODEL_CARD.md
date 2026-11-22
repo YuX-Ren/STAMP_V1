@@ -295,7 +295,7 @@ pretraining weights are not included.
 
 The PMO runner uses the same `ao_generation` weights (112,057,459 parameters)
 as a frozen motif-span mutation model. No additional PMO checkpoint is needed.
-The released `run_pmo_baseline.py` uses the shared no-surrogate, no-niching
+The released `run_pmo_baseline.py` uses the shared `stamp_pmo`
 configuration with a 10,000-call budget per task. See the
 [PMO command](https://github.com/YuX-Ren/STAMP_V1#practical-molecular-optimization-pmo)
 for input downloads and execution.

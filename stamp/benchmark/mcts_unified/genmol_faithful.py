@@ -24,7 +24,6 @@ from .subtree import edit_candidate_spans, parse_terminal_sequence
 from .novelty import NoveltyScorer, rank_by_composite
 from .target_aware import TargetAwareHelper
 from .tree_crossover import tree_crossover
-from .chemistry_filters import SurrogateRanker
 
 
 def _try_load_sa_scorer():
@@ -423,13 +422,6 @@ class GenMolFaithfulConfig:
     fragment_min_atoms: int = 0   # filter vocab CSV: drop fragments with < N heavy atoms
     fragment_max_atoms: int = 0   # filter vocab CSV: drop fragments with > N heavy atoms; 0 disables
     mutation_prob: float = 1.0    # apply mutation with this probability per crossover (f-RAG uses 0.1)
-    # ---- STAMP-native chemistry methods (M11) ----
-    # M11: Subtree-attribution surrogate ranking
-    use_surrogate: bool = False
-    surrogate_k_candidates: int = 4
-    surrogate_refit_every: int = 200
-    surrogate_min_obs: int = 30
-    surrogate_ridge_alpha: float = 1.0
     # P2: Multi-subpop scaffold diversity (FAIR — uses only Murcko scaffolds, not target)
     use_scaffold_diversity: bool = False
     scaffold_dominance_threshold: float = 0.5   # if a scaffold is > X of recent population, force exploration
@@ -440,19 +432,13 @@ class GenMolFaithfulConfig:
     # Replaces GenMol's attach() with chemistry-aware tree_crossover that swaps
     # port-signature-compatible subtrees between two parent molecules.
     use_stamp_gp: bool = False
-    gp_brood_size: int = 4               # K candidates per generation step
+    gp_brood_size: int = 1               # one candidate per generation step
     gp_size_delta: int = 4               # max heavy-atom diff between swapped subtrees
     gp_min_pool_size: int = 30           # min _mol_pool size before GP activates
     gp_attach_fallback: bool = True      # if all crossover attempts fail, fall back to attach()
     gp_max_tries: int = 3                # tree_crossover internal retries per call
     gp_match_mode: str = "port_sig"      # 'port_sig' (default) or 'topo_hash' (strict tree isomorphism)
     gp_n_swaps: int = 1                  # number of simultaneous disjoint subtree swaps (multi-point crossover)
-    # ---- STAMP-GP Layer 3: Scaffold Niching ----
-    # Maintain N Murcko-scaffold niches in _mol_pool to resist scaffold collapse.
-    use_scaffold_niching: bool = False
-    niche_capacity: int = 8              # top-K mols per niche
-    max_niches: int = 25                 # max distinct scaffolds tracked
-    niche_intra_prob: float = 0.6        # P(both parents from same niche)
     # ---- STAMP-design tuning knobs (defaults disable the filters) ----
     # Acceptance filters applied to every candidate molecule before scoring.
     # When a candidate violates a hard limit, it's dropped and the loop tries another.
@@ -581,9 +567,6 @@ class GenMolFaithfulOptimizer:
         self.best_reward = 0.0
         self.best_smiles: Optional[str] = None
         self._mol_pool: List[Tuple[float, str]] = []
-        # ---- STAMP chemistry filters (M11) ----
-        self._surrogate_ranker: Optional[SurrogateRanker] = None
-        self.n_surrogate_picks = 0
         # ---- P2: Scaffold diversity tracking (FAIR — Murcko only, no target) ----
         self._scaffold_history: List[str] = []  # Murcko scaffold per scored molecule
         self.n_scaffold_diff_forced = 0
@@ -595,23 +578,6 @@ class GenMolFaithfulOptimizer:
                 f"min_pool={self.config.gp_min_pool_size} "
                 f"attach_fallback={self.config.gp_attach_fallback}"
             )
-        # ---- Scaffold Niching (Layer 3) ----
-        # niches: scaffold_smiles -> sorted list of (score, smiles), top-K per niche.
-        self._niches: Dict[str, List[Tuple[float, str]]] = {}
-        if self.config.use_scaffold_niching:
-            logger.info(
-                f"[genmol/{task}] scaffold niching enabled, "
-                f"max_niches={self.config.max_niches} cap={self.config.niche_capacity} "
-                f"intra_prob={self.config.niche_intra_prob}"
-            )
-        if self.config.use_surrogate:
-            self._surrogate_ranker = SurrogateRanker(
-                encoder,
-                ridge_alpha=self.config.surrogate_ridge_alpha,
-                refit_every=self.config.surrogate_refit_every,
-                min_observations=self.config.surrogate_min_obs,
-            )
-            logger.info(f"[genmol/{task}] M11 surrogate ranker enabled, K={self.config.surrogate_k_candidates}")
         # STAMP-design filter bookkeeping
         self._sa_scorer = _try_load_sa_scorer() if (self.config.sa_max > 0.0 or self.config.sa_alpha > 0.0) else None
         self.n_filter_rejects_mw = 0
@@ -703,12 +669,6 @@ class GenMolFaithfulOptimizer:
                 self._target.note_oracle_call(self.best_reward, self.n_calls)
             if self.config.tree_crossover_prob > 0 or self.config.use_stamp_gp:
                 self._update_mol_pool(smiles, prop)
-            # M11: feed surrogate ranker
-            if self._surrogate_ranker is not None:
-                self._surrogate_ranker.observe(smiles, prop)
-            # Scaffold niching: insert into Murcko-scaffold-keyed niche
-            if self.config.use_scaffold_niching:
-                self._update_niches(smiles, prop)
             # P2: track scaffold history
             if self.config.use_scaffold_diversity:
                 self._scaffold_history.append(self._murcko(smiles))
@@ -721,8 +681,6 @@ class GenMolFaithfulOptimizer:
                         f" gp tc_ok={self.n_tree_crossovers} tc_fail={self.n_tree_crossover_failures} "
                         f"rate={rate:.2f} pool={len(self._mol_pool)}"
                     )
-                if self.config.use_scaffold_niching:
-                    tail += f" niches={len(self._niches)}"
                 logger.info(
                     f"[genmol/{self.task}] calls={self.n_calls}/{budget} "
                     f"best={self.best_reward:.4f} pop_top={self.population[0][0]:.4f} "
@@ -748,18 +706,6 @@ class GenMolFaithfulOptimizer:
                 "tree_crossover_failures": int(self.n_tree_crossover_failures),
                 "success_rate": (self.n_tree_crossovers / tot) if tot > 0 else 0.0,
                 "final_mol_pool_size": len(self._mol_pool),
-            }
-        if self.config.use_scaffold_niching:
-            out["scaffold_niching_stats"] = {
-                "n_niches": len(self._niches),
-                "top_niches": [
-                    {
-                        "scaffold": k[:64],
-                        "size": len(v),
-                        "best": v[0][0] if v else 0.0,
-                    }
-                    for k, v in sorted(self._niches.items(), key=lambda kv: -kv[1][0][0])[:10]
-                ],
             }
         return out
 
@@ -812,64 +758,6 @@ class GenMolFaithfulOptimizer:
             return top
         return None
 
-    def _update_niches(self, smiles: str, score: float) -> None:
-        """Maintain Murcko-scaffold-keyed top-K niches.
-
-        Inserts (score, smiles) into the niche keyed by its Murcko scaffold;
-        evicts within-niche worst when over capacity, evicts whole-niche
-        worst (by best score) when over max_niches.
-        """
-        scaffold = self._murcko(smiles) or "<no_scaffold>"
-        niche = self._niches.setdefault(scaffold, [])
-        for i, (s, sm) in enumerate(niche):
-            if sm == smiles:
-                if score > s:
-                    niche[i] = (float(score), smiles)
-                    niche.sort(reverse=True)
-                return
-        niche.append((float(score), smiles))
-        niche.sort(reverse=True)
-        if len(niche) > self.config.niche_capacity:
-            niche.pop()
-        # Cap total niches: if over, drop the niche with the lowest top score
-        if len(self._niches) > self.config.max_niches:
-            worst_key = min(self._niches, key=lambda k: self._niches[k][0][0])
-            if worst_key != scaffold:
-                del self._niches[worst_key]
-            else:
-                # The new niche itself is the worst -> drop it
-                del self._niches[scaffold]
-
-    def _sample_parents_from_niches(self) -> Optional[Tuple[str, str]]:
-        """Pick a (mol_a, mol_b) parent pair from scaffold niches.
-
-        Returns None if niches not yet populated. Otherwise samples 2 mols:
-          - with prob niche_intra_prob: both from same niche (within-scaffold evolution)
-          - else: one from each of two different niches (cross-scaffold)
-        """
-        if len(self._niches) < 1:
-            return None
-        keys = list(self._niches.keys())
-        if (
-            len(keys) >= 2
-            and random.random() >= self.config.niche_intra_prob
-        ):
-            k1, k2 = random.sample(keys, 2)
-            n1 = self._niches[k1]
-            n2 = self._niches[k2]
-            if not n1 or not n2:
-                return None
-            return n1[random.randrange(len(n1))][1], n2[random.randrange(len(n2))][1]
-        # Within-niche: pick a niche with >= 2 mols
-        viable = [k for k in keys if len(self._niches[k]) >= 2]
-        if not viable:
-            # Fallback: pick any 2 mols across niches
-            all_mols = [m for k in keys for _, m in self._niches[k]]
-            if len(all_mols) < 2:
-                return None
-            return tuple(random.sample(all_mols, 2))  # type: ignore
-        k = random.choice(viable)
-        return tuple(self._niches[k][i][1] for i in random.sample(range(len(self._niches[k])), 2))  # type: ignore
 
     def _stamp_gp_propose(self) -> Optional[str]:
         """STAMP-GP: pick parent pair from molecule pool by score-softmax and run
@@ -881,13 +769,8 @@ class GenMolFaithfulOptimizer:
         """
         if len(self._mol_pool) < max(2, self.config.gp_min_pool_size):
             return None
-        # Prefer niche-based parent selection when scaffold niching is on.
         m1: Optional[str] = None
         m2: Optional[str] = None
-        if self.config.use_scaffold_niching:
-            pair = self._sample_parents_from_niches()
-            if pair is not None:
-                m1, m2 = pair
         if m1 is None or m2 is None:
             if self.config.parent_sampling_tau > 0:
                 scores_arr = np.array([s for s, _ in self._mol_pool], dtype=np.float64)
@@ -1000,54 +883,13 @@ class GenMolFaithfulOptimizer:
             return None
         return smi
 
+
     def _generate(self) -> Optional[str]:
-        if self.config.target_aware and self._target.in_zero_in_phase(self.n_calls):
-            out = self._generate_zero_in()
-            if out is not None:
-                return out
-        # P2: scaffold-diversity divert
-        dominant = self._dominant_scaffold()
-        force_diff = (
-            dominant is not None
-            and random.random() < self.config.scaffold_force_diff_rate
-        )
-        if force_diff:
-            self.n_scaffold_diff_forced += 1
-            for _ in range(self.config.scaffold_force_diff_max_tries):
-                cand = self._generate_one()
-                if cand is None:
-                    continue
-                if self._murcko(cand) != dominant:
-                    self.n_scaffold_diff_succeeded += 1
-                    return cand
-            # fall through if we couldn't find a different-scaffold candidate
-        # Decide K candidates (brood size).
-        #   STAMP-GP on  : K = gp_brood_size (independent of surrogate readiness)
-        #   surrogate on : K = surrogate_k_candidates once surrogate is_ready
-        #   otherwise    : K = 1
-        K = 1
-        if self.config.use_stamp_gp:
-            K = max(1, int(self.config.gp_brood_size))
-        elif self._surrogate_ranker is not None and self._surrogate_ranker.is_ready:
-            K = max(1, int(self.config.surrogate_k_candidates))
-        candidates: List[str] = []
-        attempts = 0
-        max_attempts = self.config.n_attach_tries
-        while len(candidates) < K and attempts < max_attempts:
-            attempts += 1
-            cand = self._generate_one()
-            if cand is None:
-                continue
-            candidates.append(cand)
-        if not candidates:
-            return None
-        if K == 1 or self._surrogate_ranker is None or not self._surrogate_ranker.is_ready:
-            return candidates[0]
-        # M11: surrogate-rank candidates
-        scored = [(c, self._surrogate_ranker.predict(c)) for c in candidates]
-        scored.sort(key=lambda x: -x[1])
-        self.n_surrogate_picks += 1
-        return scored[0][0]
+        for _ in range(self.config.n_attach_tries):
+            candidate = self._generate_one()
+            if candidate is not None:
+                return candidate
+        return None
 
     def _apply_one_mutation(self, smi: str) -> Optional[str]:
         mode = self._mutation_mode

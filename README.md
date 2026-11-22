@@ -192,8 +192,8 @@ and 100 change-identification pairs, with their original experiment manifests.
 ### Practical molecular optimization (PMO)
 
 PMO uses the same frozen 112M pretraining baseline, `ao_generation`.
-The shared configuration in `scripts/benchmark/configs/pmo_no_surrogate.json`
-disables surrogate ranking and scaffold niching. Each of the 23 tasks uses
+The shared configuration is `scripts/benchmark/configs/pmo.json` (`stamp_pmo`).
+Each of the 23 tasks uses
 10,000 oracle calls and reports AUC of the top-10 mean reward.
 
 After creating the training environment, install the PMO dependencies. PyTDC

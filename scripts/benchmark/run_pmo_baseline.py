@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Run STAMP PMO with a shared configuration, no surrogate and no niching.
+r"""Run STAMP PMO with the shared public configuration.
 
 The selected candidate is the first valid, unscored proposal. Fragment scores,
 max-update selection, subtree crossover and mutation are retained from the
@@ -9,7 +9,7 @@ per-task winning configuration is read.
 Example:
   PYTHONHASHSEED=0 python scripts/benchmark/run_pmo_baseline.py \
     --task qed --seed 1 \
-    --output results/benchmark/pmo_no_surrogate/qed/s1.json
+    --output results/pmo/qed/s1.json
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PROFILE = Path(__file__).resolve().parent / "configs/pmo_no_surrogate.json"
+DEFAULT_PROFILE = Path(__file__).resolve().parent / "configs/pmo.json"
 
 
 def load_profile(path: Path) -> dict[str, Any]:
@@ -39,14 +39,12 @@ def load_profile(path: Path) -> dict[str, Any]:
     if set(profile) != {"name", "oracle_budget", "generator", "optimizer"}:
         raise ValueError("Profile requires name, oracle_budget, generator and optimizer")
     cfg = profile["optimizer"]
-    required = {"use_surrogate": False, "gp_brood_size": 1,
-                "surrogate_k_candidates": 1, "target_aware": False,
+    required = {"gp_brood_size": 1, "target_aware": False,
                 "use_scaffold_diversity": False, "novelty_weight": 0.0,
-                "use_scaffold_niching": False,
                 "tree_crossover_prob": 0.0, "mutation_mode": "ao_gpt"}
     for name, expected in required.items():
         if name not in cfg or cfg[name] != expected:
-            raise ValueError(f"No-surrogate baseline requires {name}={expected!r}")
+            raise ValueError(f"STAMP PMO requires {name}={expected!r}")
     for name in ("population_size", "molecule_pool_size", "max_iterations",
                  "n_attach_tries", "gp_max_tries", "gp_min_pool_size", "log_every"):
         if type(cfg.get(name)) is not int or cfg[name] <= 0:
@@ -81,15 +79,9 @@ def make_optimizer_class(base_class: type, chemistry: Any) -> type:
     class BaselineOptimizer(base_class):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             cfg = kwargs["config"]
-            if cfg.use_surrogate or cfg.gp_brood_size != 1 or cfg.surrogate_k_candidates != 1:
-                raise ValueError("Baseline requires no surrogate and a single-candidate brood")
-            if cfg.use_scaffold_niching:
-                raise ValueError("Baseline requires scaffold niching disabled")
+            if cfg.gp_brood_size != 1:
+                raise ValueError("STAMP PMO requires a single-candidate brood")
             super().__init__(*args, **kwargs)
-            if self._surrogate_ranker is not None:
-                raise RuntimeError("Baseline unexpectedly constructed a surrogate")
-            if self._niches:
-                raise RuntimeError("Baseline unexpectedly initialized scaffold niches")
             self._canon_seen: set[str] = set()
             self._stamp_cache.parsed = functools.lru_cache(maxsize=4096)(
                 self._stamp_cache.parsed
@@ -132,8 +124,6 @@ def make_optimizer_class(base_class: type, chemistry: Any) -> type:
             self._canon_seen.add(key)
             return False
 
-        def _update_niches(self, smiles: str, score: float) -> None:
-            raise RuntimeError("Scaffold niche updates are disabled in this baseline")
 
     return BaselineOptimizer
 
@@ -166,8 +156,6 @@ def output_paths(output: Path) -> list[Path]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source-root", type=Path, default=ROOT,
-                        help="Optimizer source root (defaults to this source checkout)")
     parser.add_argument("--config", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument("--model-dir", type=Path, default=ROOT / "checkpoints/ao_generation")
     parser.add_argument("--vocab-dir", type=Path, default=ROOT / "datasets/main/data/pmo/fragment_vocab")
@@ -203,7 +191,7 @@ def main() -> None:
     os.environ["STAMP_INFERENCE_FP32"] = "1"
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[name] = str(args.threads)
-    snapshot = args.source_root.resolve()
+    snapshot = ROOT
     if not (snapshot / "stamp/benchmark/mcts_unified/genmol_faithful.py").is_file():
         raise SystemExit(f"Missing optimizer source: {snapshot}")
     model_dir = args.model_dir.resolve()
@@ -273,11 +261,10 @@ def main() -> None:
             for path in sorted((snapshot / "stamp").rglob("*.py")) if "__pycache__" not in path.parts
         }
         metadata = {
-            "task": args.task, "seed": args.seed, "variant": "no_surrogate", "budget": budget,
+            "task": args.task, "seed": args.seed, "variant": "stamp_pmo", "budget": budget,
             "profile_name": profile["name"], "profile": profile, "source_root": str(snapshot),
             "config": dataclasses.asdict(config), "generator": settings,
-            "candidate_selection": "first_valid_unscored_candidate", "surrogate_enabled": False,
-            "niching_enabled": False,
+            "candidate_selection": "first_valid_unscored_candidate",
             "fragment_scoring": "CSV initialization; max-update from true molecule oracle reward; top-K retention",
             "task_size_policy": "optimizer task-family molecule and initial-fragment size ranges",
             "source_files_sha256": source_hashes,
@@ -294,7 +281,7 @@ def main() -> None:
         with output.with_suffix(".meta.json").open("x") as handle:
             json.dump(metadata, handle, indent=2)
             handle.write("\n")
-        logging.info("START baseline=%s task=%s seed=%s budget=%s surrogate=off niching=off brood=1",
+        logging.info("START baseline=%s task=%s seed=%s budget=%s brood=1",
                      profile["name"], args.task, args.seed, budget)
         result = optimizer.run(budget)
     finally:
@@ -302,15 +289,10 @@ def main() -> None:
     metric = auc_top_k_from_log(oracle._log, k=10, max_calls=budget)
     if metric["n_oracle_calls"] != result["n_calls"] or metric["n_unique_smiles"] != result["n_calls"]:
         raise RuntimeError("Baseline oracle accounting or canonical deduplication mismatch")
-    if optimizer._surrogate_ranker is not None or optimizer.n_surrogate_picks != 0:
-        raise RuntimeError("Surrogate unexpectedly active during baseline execution")
-    if optimizer._niches or optimizer.config.use_scaffold_niching:
-        raise RuntimeError("Scaffold niching unexpectedly active during baseline execution")
     payload = {
         **metadata, "metric": metric, "summary": {"mean_auc_top_10": metric["auc_top_k"]},
         "diagnostics": {key: value for key, value in result.items() if key not in {"oracle_log", "trajectory"}},
-        "baseline_stats": optimizer.baseline_stats, "n_surrogate_picks": 0,
-        "n_scaffold_niches": 0,
+        "baseline_stats": optimizer.baseline_stats,
         "budget_exhausted": oracle.n_calls == budget,
         "total_elapsed_seconds": time.time() - started,
         "sampling_diagnostics": getattr(edit, "stats", {}),
@@ -319,7 +301,7 @@ def main() -> None:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
     output.with_suffix(".json.tmp").rename(output)
-    logging.info("DONE AUC=%.6f calls=%s/%s selected=%s surrogate_picks=0 elapsed=%.1fs output=%s",
+    logging.info("DONE AUC=%.6f calls=%s/%s selected=%s elapsed=%.1fs output=%s",
                  metric["auc_top_k"], oracle.n_calls, budget,
                  optimizer.baseline_stats["selected_candidates"], payload["total_elapsed_seconds"], output)
 
