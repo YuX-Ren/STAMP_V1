@@ -13,7 +13,7 @@ molecule–text encoder–decoders trained with STAMP representations.
 
 ## Released checkpoints
 
-The Hub repository contains eighteen model directories. Download the complete
+The Hub repository contains fifteen model directories. Download the complete
 selected directory, including its vocabulary and configuration files.
 
 | Directory | Intended task | Model file | Version |
@@ -23,9 +23,6 @@ selected directory, including its vocabulary and configuration files.
 | `scaffold_decoration` | Scaffold decoration | `model.pt` | Additional task adaptation, 10 epochs |
 | `encoder_mlm` | Molecular embeddings and supervised property fine-tuning | `pretrained_roberta.pt` | PubChem MLM, final epoch 10 |
 | `encoder_mtr` | Molecular embeddings and supervised property fine-tuning | `pretrained_roberta.pt` | PubChem descriptor regression, best validation checkpoint |
-| `molt5_pretrain_500k` | Initialization for molecule–text tasks | `model.safetensors` | Mixed C4/ZINC pretraining, step 500,000 |
-| `molt5_mol2text_from500k` | Molecular captioning | `model.safetensors` | ChEBI-20 adaptation from 500k |
-| `molt5_text2mol_from500k` | Text-conditioned molecular generation | `model.safetensors` | ChEBI-20 adaptation from 500k |
 | `molt5_mol2text_from350k` | Molecular captioning | `model.safetensors` | Earlier ChEBI-20 adaptation from 350k |
 | `molt5_text2mol_from350k` | Text-conditioned molecular generation | `model.safetensors` | Earlier ChEBI-20 adaptation from 350k |
 | `controlled_stamp` | Controlled stamp generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
@@ -43,15 +40,14 @@ use the Transformers T5 format; the repository root is not a single
 or MTR pretraining heads, not the task-specific MoleculeNet/MoleculeACE heads.
 AO-GPT `.pt` files also contain optimizer/scaler and training-progress state;
 their file size is larger than the model tensors alone. The MolT5 release
-contains model weights and tokenizer/configuration files, without its separate
-pretraining optimizer-state file.
+contains two task-adapted models with tokenizer/configuration files.
+Standalone MolT5 pretraining weights are not included.
 Frozen language-model API systems used elsewhere in the paper are not included
 in this collection.
 
-The initial weight payload is available at revision
-`1830ad743012ff605f361a824b3ffcfd49d36cf2`. The current
+The current
 [manifest.json](https://huggingface.co/bi0s/STAMP_V1/blob/main/manifest.json)
-lists artifact byte sizes and SHA-256 values. All eighteen weight files were
+lists artifact byte sizes and SHA-256 values. All fifteen weight files were
 verified against their local source hashes after upload.
 
 ### Four-layer controlled comparison
@@ -232,7 +228,7 @@ density 0.15 and mean noise-span length 3.
 
 | Setting | Pretraining | ChEBI-20 adaptation |
 | --- | --- | --- |
-| Budget | 500,000 steps | Up to 30 epochs; best-validation checkpoint |
+| Parent checkpoint | Step 350,000 | Up to 30 epochs; best-validation checkpoint |
 | Global batch | 1,024, across four H200 GPUs | 32, on one GPU |
 | Learning rate | 1.4e-4 | 5e-4 |
 | Optimizer / weight decay | AdamW / 0.01 | AdamW / 0.01 |
@@ -241,24 +237,14 @@ density 0.15 and mean noise-span length 3.
 | Precision / seed | BF16 / 42 | BF16 / 42 |
 | Validation / early stopping | Every 10,000 steps | Every 500 steps; patience 6 validation evaluations |
 
-The released pretraining run uses cosine decay after warm-up, as confirmed by
-the trainer and saved optimizer state. The paper's Methods describe linear
-decay for this stage; this is a training-description discrepancy. See the
-[training summary](https://huggingface.co/bi0s/STAMP_V1/blob/main/molt5_pretrain_500k/training_summary.json)
-for the recorded configuration and saved-learning-rate check. The downstream
-fine-tuning schedule defaults to linear decay after warm-up.
-
-Final pretraining validation perplexities are 3.7428 combined, 5.7974 on C4
-and 2.4163 on molecular examples. The
-[validation history](https://huggingface.co/bi0s/STAMP_V1/blob/main/molt5_pretrain_500k/eval_history.json)
-records the trajectory.
+The pretraining trainer uses cosine decay after warm-up; the paper's Methods
+describe linear decay for this stage. The downstream fine-tuning schedule
+defaults to linear decay after warm-up.
 
 | Downstream checkpoint | Saved epoch | Saved step | Validation loss |
 | --- | ---: | ---: | ---: |
 | `molt5_mol2text_from350k` | 13 | 11,500 | 0.550620 |
 | `molt5_text2mol_from350k` | 13 | 11,500 | 0.554479 |
-| `molt5_mol2text_from500k` | 12 | 10,500 | 0.544408 |
-| `molt5_text2mol_from500k` | 13 | 11,500 | 0.558089 |
 
 ## Evaluation results
 
@@ -295,21 +281,15 @@ STAMP before scoring; validity and exact match below are percentages.
 | Captioning checkpoint | BLEU-2 | BLEU-4 | METEOR | ROUGE-L |
 | --- | ---: | ---: | ---: | ---: |
 | From 350k | 0.511805 | 0.422907 | 0.550187 | 0.566299 |
-| From 500k | 0.516725 | 0.425199 | 0.552336 | 0.563288 |
 
 | Text-to-molecule checkpoint | Validity, % | Exact match, % | MACCS similarity | Morgan similarity |
 | --- | ---: | ---: | ---: | ---: |
 | From 350k | 97.5455 | 10.5455 | 0.774475 | 0.538839 |
-| From 500k | 97.1515 | 10.0303 | 0.781090 | 0.543821 |
 
 Each downstream model directory includes `evaluation_metrics.json` with its
-full archived metric record. The 350k records come from the `eval_test_v2`
-evaluation and the 500k records from `eval_test`. The manuscript describes
-500k initialization, while its headline text-to-molecule validity/exact-match
-values are closer to the 350k archived results. Exact figure reproduction
-requires resolving that checkpoint/protocol correspondence; the versions must
-not be treated as interchangeable. The standalone 350k pretraining checkpoint
-is not included, but both downstream adaptations from it are included.
+full archived metric record from `eval_test_v2`. Both released MolT5 models
+were adapted from the step-350,000 pretraining checkpoint; standalone
+pretraining weights are not included.
 
 ## Download and use
 
