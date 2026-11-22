@@ -13,7 +13,7 @@ molecule–text encoder–decoders trained with STAMP representations.
 
 ## Released checkpoints
 
-The Hub repository contains ten model directories. Download the complete
+The Hub repository contains eighteen model directories. Download the complete
 selected directory, including its vocabulary and configuration files.
 
 | Directory | Intended task | Model file | Version |
@@ -28,6 +28,14 @@ selected directory, including its vocabulary and configuration files.
 | `molt5_text2mol_from500k` | Text-conditioned molecular generation | `model.safetensors` | ChEBI-20 adaptation from 500k |
 | `molt5_mol2text_from350k` | Molecular captioning | `model.safetensors` | Earlier ChEBI-20 adaptation from 350k |
 | `molt5_text2mol_from350k` | Text-conditioned molecular generation | `model.safetensors` | Earlier ChEBI-20 adaptation from 350k |
+| `controlled_stamp` | Controlled stamp generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_smiles` | Controlled smiles generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_selfies` | Controlled selfies generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_group_selfies` | Controlled group-selfies generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_safe` | Controlled safe generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_fragsmiles` | Controlled fragsmiles generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_tsmiles` | Controlled t-smiles generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
+| `controlled_molcano` | Controlled molcano generation | `model.pt` | Four-layer causal Transformer, 10 epochs |
 
 The `.pt` files use STAMP's custom PyTorch classes. The MolT5 subdirectories
 use the Transformers T5 format; the repository root is not a single
@@ -37,14 +45,67 @@ AO-GPT `.pt` files also contain optimizer/scaler and training-progress state;
 their file size is larger than the model tensors alone. The MolT5 release
 contains model weights and tokenizer/configuration files, without its separate
 pretraining optimizer-state file.
-The four-layer controlled-generation models and frozen language-model API
-systems used elsewhere in the paper are not included in this collection.
+Frozen language-model API systems used elsewhere in the paper are not included
+in this collection.
 
 The initial weight payload is available at revision
 `1830ad743012ff605f361a824b3ffcfd49d36cf2`. The current
 [manifest.json](https://huggingface.co/bi0s/STAMP_V1/blob/main/manifest.json)
-lists artifact byte sizes and SHA-256 values. All ten weight files were
+lists artifact byte sizes and SHA-256 values. All eighteen weight files were
 verified against their local source hashes after upload.
+
+### Four-layer controlled comparison
+
+The eight `controlled_*` directories contain the original weights from
+`benchmark_20260403_193312`, with their token vocabulary, training metadata,
+training history and archived evaluation metrics. These are standard causal
+Transformers: 4 layers, hidden size 256, 8 attention heads, feed-forward size
+1,024, GELU, post-layer normalization, learned positional embeddings, dropout
+0.1 and maximum sequence length 256. They are separate from the larger
+any-order models above.
+
+All representations share the 100,000/10,000/10,000 molecule train/validation/test
+split. Training uses AdamW, learning rate 3e-4, weight decay 0.01, batch size
+256, 10 epochs and seed 42. MOLCANO successfully encodes 99,998 training
+molecules; the others encode all 100,000. Model parameter counts differ with
+the token vocabulary. The STAMP checkpoint has 19,469 model tokens; use its
+bundled `vocab.json` when loading it.
+
+The following archived results each use 10,000 generated samples, temperature
+1.0 and top-k 50. They are single-run controlled comparisons, separate from
+the five-seed large-model results below.
+
+| Representation | Vocabulary size | Parameters | Validity, % | Quality, % |
+| --- | --- | --- | --- | --- |
+| stamp | 19,469 | 13,193,216 | 97.38 | 75.54 |
+| smiles | 37 | 3,244,032 | 79.66 | 55.21 |
+| selfies | 95 | 3,273,728 | 100.00 | 43.21 |
+| group-selfies | 90 | 3,271,168 | 100.00 | 46.40 |
+| safe | 65 | 3,258,368 | 47.81 | 32.77 |
+| fragsmiles | 4,303 | 5,428,224 | 91.87 | 66.76 |
+| t-smiles | 50 | 3,250,688 | 87.71 | 58.42 |
+| molcano | 349 | 3,403,776 | 40.21 | 31.37 |
+
+A standalone PyTorch loader is included at the Hub root. It loads all eight
+architectures and returns token logits; converting tokens to SMILES requires
+the relevant representation adapter. The public source adapters for t-SMILES
+and MOLCANO still require synchronization with the original experiment code.
+
+```python
+from huggingface_hub import snapshot_download
+import importlib.util
+import torch
+
+root = snapshot_download("bi0s/STAMP_V1", allow_patterns=[
+    "controlled_stamp/*", "controlled_decoder.py",
+])
+spec = importlib.util.spec_from_file_location("controlled_decoder", f"{root}/controlled_decoder.py")
+loader = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(loader)
+model, itos = loader.load_controlled_model(f"{root}/controlled_stamp")
+with torch.no_grad():
+    logits = model(torch.tensor([[0, 1, 2]]))
+```
 
 ## Architecture and representation
 

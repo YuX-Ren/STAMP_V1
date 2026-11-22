@@ -1830,7 +1830,15 @@ def load_trained_model(
     rep_name = ckpt["representation"]
 
     vocab = TokenVocab.from_dict(json.loads(vocab_path.read_text(encoding="utf-8")))
-    if model_type == "llama":
+    state_dict = {
+        k.removeprefix("_orig_mod."): v for k, v in ckpt["model_state"].items()
+    }
+    if "blocks.layers.0.self_attn.in_proj_weight" in state_dict:
+        from .controlled_decoder import ControlledDecoderLM
+
+        cfg.model_type = "decoder"
+        model = ControlledDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
+    elif model_type == "llama":
         model: LMModel = LlamaDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
     elif model_type in ("decoder", "ao_gpt", "ao_gpt_pp"):
         model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg)
@@ -1840,12 +1848,6 @@ def load_trained_model(
         # arch matches standard MDM transformers.
         cfg.use_adaln = False
         model = TinyDecoderLM(vocab_size=len(vocab.itos), cfg=cfg, bidirectional=True)
-    state_dict = ckpt["model_state"]
-    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
-        state_dict = {
-            (k[len("_orig_mod.") :] if k.startswith("_orig_mod.") else k): v
-            for k, v in state_dict.items()
-        }
     model.load_state_dict(state_dict)
 
     dev = _resolve_torch_device(device)

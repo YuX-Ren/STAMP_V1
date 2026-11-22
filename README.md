@@ -99,6 +99,7 @@ Pretrained weights and companion vocabularies/configurations are available on
 | Task | Checkpoint directory |
 | --- | --- |
 | De novo generation | `ao_generation` |
+| Four-layer comparison, eight representations | `controlled_*` (see model card) |
 | Linker, motif extension, superstructure | `fragment_infill` |
 | Scaffold decoration | `scaffold_decoration` |
 | Property learning | `encoder_mlm`, `encoder_mtr` |
