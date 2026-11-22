@@ -107,8 +107,10 @@ train/test assignments. Canonicalization, invalid-input removal and
 vocabulary construction are workflow-specific; held-out benchmark partitions
 do not establish exclusion from every large or third-party pretraining corpus.
 The data release's [coverage report](https://huggingface.co/datasets/bi0s/STAMP_V1-data/blob/main/main/data/manifests/coverage.json)
-identifies remaining custom editing-dataset gaps. Those datasets are separate
-from the released generative and encoder pretraining inputs.
+maps the exact S2 task snapshots (six tasks, 500 examples each), shared-label
+transfer snapshot (120 examples) and change-identification snapshot (100 pairs)
+to their original experiment manifests. These downstream evaluation inputs are
+separate from the generative and encoder pretraining corpora.
 
 ## Objectives and optimization
 

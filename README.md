@@ -184,6 +184,9 @@ splits, property datasets and checksums are available in the public
 [data repository](https://huggingface.co/datasets/bi0s/STAMP_V1-data).
 Its [file index](https://huggingface.co/datasets/bi0s/STAMP_V1-data/blob/main/main/data/manifests/release_files.tsv)
 lists the actual downloadable files.
+The [LLM task snapshots](https://huggingface.co/datasets/bi0s/STAMP_V1-data/tree/main/main/data/llm_tasks)
+include six S2 tasks (500 examples each), 120 shared-label transfer examples
+and 100 change-identification pairs, with their original experiment manifests.
 
 ## Code layout
 
