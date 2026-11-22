@@ -219,6 +219,12 @@ Use any task name from `PMO_TASKS` in
 Outputs are the result JSON, `.meta.json` provenance and `.oracle.jsonl` trace.
 Existing run artifacts are never overwritten.
 
+The [archived per-task score table](assets/results/pmo_training_per_task.csv)
+contains 23 tasks and seeds 1–2. For `x4_init_delta2`, celecoxib rediscovery
+(seed 1) records AUC-Top-10 **0.892777** over **10,000 calls**; the selected
+mean SUM_23 is **18.644572**. These archived scores use a different checkpoint
+and search profile from the default 112M command above.
+
 ## Code layout
 
 | Directory | Contents |

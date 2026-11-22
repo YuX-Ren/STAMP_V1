@@ -65,4 +65,5 @@ Thumbs.db
 # Small publication assets and benchmark queries shipped with the examples.
 !/assets/method.pdf
 !/assets/results/
+!/assets/results/*.csv
 !/examples/fragments/*.parquet

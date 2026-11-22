@@ -12,11 +12,11 @@
 
 set -euo pipefail
 
-: "${REPO_ROOT:=/playpen-shared/mufan/github/ethanR/STAMP}"
-: "${PYTHON_BIN:=/playpen-shared/mufan/.miniforge3/bin/python}"
-: "${PARQUET:=/playpen-shared/mufan/github/ethanR/data/final/v_C_30M_v3_cm/dataset_stamp.parquet}"
-: "${STAMP_VOCAB:=/playpen-shared/mufan/github/ethanR/data/data_for_stamp/vocab/v3_cm_union.txt}"
-: "${OUTPUT_DIR:=/playpen-shared/mufan/github/ethanR/STAMP/results/slurm_ddp/v_C_30M_v3_cm/ao_bert_base_ddp}"
+: "${REPO_ROOT:=${SLURM_SUBMIT_DIR:-.}}"
+: "${PYTHON_BIN:=python}"
+: "${PARQUET:?Set PARQUET to the training parquet path or glob}"
+: "${STAMP_VOCAB:?Set STAMP_VOCAB to the motif vocabulary file}"
+: "${OUTPUT_DIR:=${REPO_ROOT}/results/ao_generation}"
 : "${TEXT_COLUMN:=stamp_smiles}"
 : "${SPLIT_COLUMN:=split_random}"
 : "${TRAIN_SPLIT:=train}"
